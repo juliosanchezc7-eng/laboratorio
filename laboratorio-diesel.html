@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v10";
+const VERSION_APP = "2026-08-11 · v11";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -672,8 +672,10 @@ function cuartoDeComponente(c){
   return (o && o.cuartoDeclaradoId) || c.cuartoId || "";
 }
 function cuartosDeOrden(o){
+  /* Si la hoja declara el cuarto, esa es la verdad: la orden pertenece a ese
+     cuarto aunque alguno de sus componentes esté mal configurado en otra sala. */
+  if(o.cuartoDeclaradoId) return new Set([o.cuartoDeclaradoId]);
   const set = new Set(DB.componentes.filter(c=>c.ordenId===o.id).map(c=>c.cuartoId).filter(Boolean));
-  if(o.cuartoDeclaradoId) set.add(o.cuartoDeclaradoId);
   const t = sinTildes(o.ot);
   DB.cuartos.forEach(c=>{ const nb=sinTildes(c.nombre); if(nb && t.indexOf(nb)>=0) set.add(c.id); });
   return set;
@@ -1060,8 +1062,10 @@ function pasoActividades(){
   const o = byId(DB.ordenes, R.ordenId);
   const me2 = YO? byId(DB.tecnicos,YO):null;
   const todosComps = DB.componentes.filter(c=>c.ordenId===R.ordenId);
-  const comps = (!R.todas && me2 && todosComps.some(c=>c.cuartoId===me2.cuartoId))
-    ? todosComps.filter(c=>c.cuartoId===me2.cuartoId) : todosComps;
+  /* El técnico ve los componentes de su cuarto; si la orden es de otro cuarto
+     los ve todos, para que un componente mal clasificado no lo deje sin registrar. */
+  const comps = (!R.todas && me2 && todosComps.some(c=>cuartoDeComponente(c)===me2.cuartoId))
+    ? todosComps.filter(c=>cuartoDeComponente(c)===me2.cuartoId) : todosComps;
   const c = R.componenteId ? byId(DB.componentes,R.componenteId) : null;
   const acts = c ? actividadesDe(c.cuartoId) : [];
   return `

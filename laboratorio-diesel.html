@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-09 · v5";
+const VERSION_APP = "2026-08-11 · v10";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -245,6 +245,7 @@ const Store = {
 
 const uid = p => (p||"id") + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 const hoyISO = () => { const d=new Date(); return new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10); };
+const restarDias = (iso,d) => { const x=new Date(iso+"T12:00:00"); x.setDate(x.getDate()-(+d||0)); return x.toISOString().slice(0,10); };
 
 /* ---------- Semillas: TODO es editable desde la pestaña Maestros ---------- */
 function semilla(){
@@ -708,24 +709,38 @@ function migrar(){
   DB.actividades.forEach(a=>{ if(!Array.isArray(a.cuartos)){a.cuartos=[];n++;} });
   DB.tipologias.forEach(t=>{ if(t.cuartoId===undefined){t.cuartoId="";n++;} if(t.tipoComponenteId===undefined){t.tipoComponenteId="";n++;} if(t.alias===undefined){t.alias="";n++;} });
   DB.registros.forEach(r=>{ if(!Array.isArray(r.historial)){r.historial=[];n++;} });
-  /* --- Limpieza única: ordena las actividades que quedaron de las cargas
-     anteriores, fusionándolas en las canónicas y dejando el reparto listo.
-     Solo corre una vez; no toca registros de producción. --- */
-  if((DB.meta.version||0) < 5){
+  /* --- Ordena las actividades: une duplicados exactos y deja la estructura
+     de diagnóstico desglosado. Se ejecuta una sola vez. No toca registros:
+     los traslada a la actividad que se conserva. --- */
+  if((DB.meta.version||0) < 6){
     const norm=x=>sinTildes(x).replace(/[^a-z0-9 ]/g," ").replace(/\s+/g," ").trim();
+    /* 1) duplicados con el mismo nombre: gana el primero, el resto se fusiona */
+    const porNom={};
+    DB.actividades.slice().forEach(a=>{
+      const k=norm(a.nombre);
+      if(porNom[k]){
+        const destino=porNom[k];
+        DB.registros.forEach(r=>{ if(r.actividadId===a.id) r.actividadId=destino.id; });
+        DB.estandares.forEach(e=>{ if(e.actividadId===a.id) e.actividadId=destino.id; });
+        DB.repartos=DB.repartos.filter(r=>r.actividadId!==a.id);
+        DB.actividades=DB.actividades.filter(x=>x.id!==a.id); n++;
+      } else porNom[k]=a;
+    });
+    /* 2) estructura canónica */
     const canon=[
-      {id:"ac_diag",      nombre:"Diagnóstico",                  fase:"Diagnóstico", cuartos:[],  alias:["diagnostico","prueba en banco","prueba inicial en tester","prueba inicial en banco","inspeccion y medicion","inspeccion visual y juegos","medicion de juegos","prueba inyector tobera"]},
-      {id:"ac_lavado",    nombre:"Lavado / limpieza",            fase:"Diagnóstico", cuartos:[],  alias:["lavado","lavado limpieza","lavado limpieza ultrasonido","limpieza ultrasonido","lavado de componentes"]},
-      {id:"ac_informe",   nombre:"Informe técnico",              fase:"Diagnóstico", cuartos:[],  alias:["informe tecnico","informe tecnico cotizacion"], porOrden:true},
-      {id:"ac_mtto_comp", nombre:"Mantenimiento del componente", fase:"Reparación",  cuartos:["cu_elec","cu_unit","cu_mec"], alias:["mantenimiento del componente","armado","desarme","cambio de repuestos","reparacion general","reparacion general proceso completo"]},
-      {id:"ac_calibra",   nombre:"Calibración en banco",         fase:"Reparación",  cuartos:["cu_elec"], alias:["calibracion","calibracion en banco","calibracion y prueba en banco","prueba final en tester","prueba final"]},
-      {id:"ac_calibra_t", nombre:"Calibración en tester",        fase:"Reparación",  cuartos:["cu_unit","cu_mec"], alias:["calibracion en tester"]},
-      {id:"ac_alist",     nombre:"Alistamiento y entrega",       fase:"Entrega",     cuartos:[],  alias:["alistamiento","alistamiento y entrega","alistamiento y pintura","empaque y entrega"]}
+      {id:"ac_desarme",  nombre:"Desarme",                      fase:"Diagnóstico", cuartos:[], alias:[]},
+      {id:"ac_test",     nombre:"Prueba en banco",              fase:"Diagnóstico", cuartos:["cu_elec"], alias:["diagnostico","prueba inicial en banco","prueba en el banco"]},
+      {id:"ac_tobera",   nombre:"Prueba inyector / tobera",     fase:"Diagnóstico", cuartos:["cu_unit","cu_mec"], alias:["prueba inyector","prueba de tobera","prueba en tester"]},
+      {id:"ac_t_inspec", nombre:"Inspección y medición",        fase:"Diagnóstico", cuartos:["cu_turbo","cu_sold","cu_torno"], alias:["inspeccion visual","medicion de juegos"]},
+      {id:"ac_lavado",   nombre:"Lavado / limpieza",            fase:"Diagnóstico", cuartos:[], alias:["lavado","limpieza","lavado limpieza ultrasonido"]},
+      {id:"ac_informe",  nombre:"Informe técnico",              fase:"Diagnóstico", cuartos:[], alias:["informe","cotizacion"], porOrden:true},
+      {id:"ac_mtto_comp",nombre:"Mantenimiento del componente", fase:"Reparación",  cuartos:["cu_elec","cu_unit","cu_mec"], alias:["armado","cambio de repuestos","reparacion general"]},
+      {id:"ac_calibra",  nombre:"Calibración en banco",         fase:"Reparación",  cuartos:["cu_elec"], alias:["calibracion","calibracion y prueba en banco"]},
+      {id:"ac_calibra_t",nombre:"Calibración en tester",        fase:"Reparación",  cuartos:["cu_unit","cu_mec"], alias:[]},
+      {id:"ac_alist",    nombre:"Alistamiento y entrega",       fase:"Entrega",     cuartos:[], alias:["alistamiento","empaque y entrega"]}
     ];
-    /* las de turbos y apoyo se conservan tal cual */
     const intocables=new Set(DB.actividades.filter(a=>
-      (a.cuartos||[]).indexOf("cu_turbo")>=0 || (a.cuartos||[]).indexOf("cu_sold")>=0 ||
-      (a.cuartos||[]).indexOf("cu_torno")>=0 || a.noProductiva).map(a=>a.id));
+      (a.cuartos||[]).indexOf("cu_turbo")>=0 || a.noProductiva).map(a=>a.id));
     const ids={};
     canon.forEach(c=>{
       let destino=DB.actividades.find(a=>a.id===c.id) ||
@@ -743,25 +758,19 @@ function migrar(){
           DB.actividades=DB.actividades.filter(a=>a.id!==vieja.id); n++;
         });
     });
-    /* comodines que ya no se usan */
     DB.actividades=DB.actividades.filter(a=>{
       if(/apoyo a otro cuarto/i.test(a.nombre) && !DB.registros.some(r=>r.actividadId===a.id)){ n++; return false; }
       return true;
     });
-    /* los tiempos por actividad se recargan desde el CSV; se conservan los TOTALES */
-    const antes=DB.estandares.length;
+    /* 3) los tiempos por actividad se recargan del CSV; se conservan los totales */
     DB.estandares=DB.estandares.filter(e=>e.actividadId===ACT_TOTAL);
-    if(DB.estandares.length!==antes) n++;
-    /* reparto listo: la hora de reparación se divide 60/40 */
-    const hayTurbo=DB.tiposComponente.find(t=>familiaDe(t.nombre)==="turbo");
+    /* 4) reparto: solo la hora de reparación */
+    const turbo=DB.tiposComponente.find(t=>familiaDe(t.nombre)==="turbo");
     DB.repartos=[{id:uid("rp"),tipoComponenteId:"*",actividadId:ids.ac_mtto_comp,porcentaje:60},
                  {id:uid("rp"),tipoComponenteId:"*",actividadId:ids.ac_calibra,porcentaje:40}];
-    const bt=(frag)=>{const a=DB.actividades.find(x=>sinTildes(x.nombre).indexOf(frag)>=0 && (x.cuartos||[]).indexOf("cu_turbo")>=0); return a?a.id:null;};
-    if(hayTurbo){
-      [[bt("sandblast"),18],[bt("balanceo"),27],[bt("armado"),42],[bt("prueba final"),13]]
-        .forEach(([a,p])=>{ if(a) DB.repartos.push({id:uid("rp"),tipoComponenteId:hayTurbo.id,actividadId:a,porcentaje:p}); });
-    }
-    /* en Unitario y Mecánico la calibración se hace en tester */
+    const bt=f=>{const a=DB.actividades.find(x=>sinTildes(x.nombre).indexOf(f)>=0 && (x.cuartos||[]).indexOf("cu_turbo")>=0); return a?a.id:null;};
+    if(turbo) [[bt("sandblast"),18],[bt("balanceo"),27],[bt("armado"),42],[bt("prueba final"),13]]
+      .forEach(([a,p])=>{ if(a) DB.repartos.push({id:uid("rp"),tipoComponenteId:turbo.id,actividadId:a,porcentaje:p}); });
     ["cu_unit","cu_mec"].forEach(cu=>{
       DB.tiposComponente.filter(t=>t.cuartoId===cu).forEach(t=>{
         DB.repartos.push({id:uid("rp"),tipoComponenteId:t.id,actividadId:ids.ac_mtto_comp,porcentaje:60});
@@ -770,7 +779,60 @@ function migrar(){
     });
     n++;
   }
-  DB.meta.version=5;
+  /* --- Reparto de la bolsa de reparación, componente por componente.
+     El peso refleja cuánto del trabajo real se lleva cada paso. --- */
+  if((DB.meta.version||0) < 7){
+    const act=(frag,cu)=>{
+      const a=DB.actividades.find(x=>sinTildes(x.nombre).indexOf(sinTildes(frag))>=0 &&
+        (!cu || !(x.cuartos||[]).length || (x.cuartos||[]).indexOf(cu)>=0));
+      return a?a.id:null;
+    };
+    const nuevos=[];
+    DB.tiposComponente.forEach(t=>{
+      const cu=t.cuartoId, cuNom=sinTildes(nom(DB.cuartos,cu)), nb=sinTildes(t.nombre);
+      const fam=familiaDe(t.nombre);
+      const mtto=act("mantenimiento del componente",cu);
+      const cal = cuNom.indexOf("electronico")>=0 ? act("calibracion en banco",cu)
+                : (cuNom.indexOf("unitario")>=0||cuNom.indexOf("mecanico")>=0) ? act("calibracion en tester",cu) || act("calibracion mecanica",cu)
+                : null;
+      let pares=[];
+      if(fam==="turbo"){
+        pares=[[act("sandblast",cu),18],[act("balanceo",cu),27],[act("armado",cu),42],[act("prueba final",cu),13]];
+      } else if(cuNom.indexOf("soldadura")>=0){
+        pares=[[act("soldadura",cu),100]];
+      } else if(cuNom.indexOf("torno")>=0){
+        pares=[[act("torneado",cu)||act("rectific",cu),100]];
+      } else if(/regulador|transferencia|microfiltro|filtro/.test(nb)){
+        /* no pasan por banco: todo el tiempo es del mantenimiento */
+        pares=[[mtto,100]];
+      } else if(/riel/.test(nb)){
+        pares=[[mtto,70],[cal,30]];
+      } else if(/bomba/.test(nb)){
+        pares=[[mtto,65],[cal,35]];
+      } else if(/inyector/.test(nb) && cuNom.indexOf("mecanico")>=0){
+        /* inyector mecánico: calibrar la tobera es la mitad del trabajo */
+        pares=[[mtto,50],[cal,50]];
+      } else {
+        pares=[[mtto,60],[cal,40]];
+      }
+      const validos=pares.filter(([a,pc])=>a && pc>0);
+      const suma=validos.reduce((x,[,pc])=>x+pc,0);
+      if(!suma) return;
+      let acum=0;
+      validos.forEach(([a,pc],k)=>{
+        const v = k===validos.length-1 ? 100-acum : Math.round(pc*100/suma);
+        acum+=v; nuevos.push({id:uid("rp"),tipoComponenteId:t.id,actividadId:a,porcentaje:v});
+      });
+    });
+    if(nuevos.length){
+      const mt=act("mantenimiento del componente"), cb=act("calibracion en banco","cu_elec");
+      DB.repartos=nuevos;
+      if(mt&&cb) DB.repartos.push({id:uid("rp"),tipoComponenteId:"*",actividadId:mt,porcentaje:60},
+                                  {id:uid("rp"),tipoComponenteId:"*",actividadId:cb,porcentaje:40});
+      n++;
+    }
+  }
+  DB.meta.version=7;
   return n;
 }
 async function cargar(){
@@ -955,6 +1017,9 @@ function pasoOrden(){
         <input type="date" id="fechaReg" value="${R.fecha}" max="${hoyISO()}" ${minFecha?`min="${minFecha}"`:""}></label>
       ${minFecha&&R.fecha<minFecha?`<p class="hint" style="color:var(--signal);margin-top:-6px">Solo puedes registrar hasta ${DB.meta.diasRetro} día(s) atrás. Para fechas anteriores, pídeselo a coordinación.</p>`:""}
       <label class="f"><span>Buscar OT, cliente o tipología</span><input type="search" id="buscaOT" placeholder="Ej: 36093, Umbarela o ISB" value="${esc(R.busca)}"></label>
+      ${miCuarto?`<p class="hint" style="margin-top:-6px">Estás registrando como <b>${esc(nom(DB.tecnicos,YO))}</b>, del cuarto <b>${esc(nom(DB.cuartos,miCuarto))}</b>. Si no es tu cuarto, avísale a coordinación.</p>`:""}
+      <button class="btn" id="sinOrden" style="margin-bottom:12px;width:100%">Registrar algo que no es de una orden</button>
+      <p class="hint" style="margin-top:-6px">Aseo, capacitación, mantenimiento de equipos, apoyo a otra sede.</p>
       ${miCuarto?`<label class="hint" style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;padding:9px 11px;border:1px solid ${R.todas?"var(--prussian)":"var(--line)"};border-radius:var(--r);background:${R.todas?"#f2f7fb":"#fff"}">
         <input type="checkbox" id="verTodas" ${R.todas?"checked":""} style="width:18px;height:18px;accent-color:var(--prussian)">
         <span><b>Hoy estoy apoyando otro cuarto</b><br>
@@ -982,7 +1047,12 @@ function pasoOrden(){
           ? `Ninguna orden abierta de ${esc(nom(DB.cuartos,miCuarto))} coincide con “${esc(q)}”.<br><br>
              <button class="btn primary" id="crearBuscada">Crear la orden ${esc(q)}</button>`
           : `No hay órdenes abiertas asignadas a <b>${esc(nom(DB.cuartos,miCuarto))}</b>.<br><br>
-             Si estás apoyando otro cuarto, marca <b>“Ver órdenes de todos los cuartos”</b> arriba.`}</div>`}
+             ${(()=>{const porCu=DB.cuartos.map(c=>({c, n:abiertas.filter(o=>cuartosDeOrden(o).has(c.id)).length})).filter(x=>x.n);
+               const sinCu=abiertas.filter(o=>!cuartosDeOrden(o).size).length;
+               if(!abiertas.length) return "No hay ninguna orden abierta en el laboratorio. Avísale a coordinación para que sincronice.";
+               return `Hay ${abiertas.length} órdenes abiertas repartidas así:<br>
+                 <span class="tag">${porCu.map(x=>esc(x.c.nombre)+": "+x.n).join(" · ")}${sinCu?` · sin cuarto: ${sinCu}`:""}</span><br><br>
+                 Marca <b>“Hoy estoy apoyando otro cuarto”</b> arriba para verlas todas, y avísale a coordinación.`;})()}`}</div>`}
     </div>
   </div>`;
 }
@@ -996,8 +1066,10 @@ function pasoActividades(){
   const acts = c ? actividadesDe(c.cuartoId) : [];
   return `
   <div class="card">
-    <header><h2>Paso 2 · ¿Qué hiciste?</h2><span class="sub mono">OT ${esc(o?o.ot:"")}</span></header>
+    <header><h2>Paso 2 · ¿Qué hiciste?</h2><span class="sub mono">OT ${esc(o?etiquetaOT(o):"")}</span></header>
     <div class="body">
+      ${R.recienGuardado?`<div style="border:1px solid #b6ddc6;background:#eaf6ef;color:var(--green);padding:10px 12px;border-radius:var(--r);margin-bottom:12px;font-size:13.5px">
+        <b>Guardado.</b> Esta orden tiene más componentes: elige otro abajo para seguir registrando, o pulsa <b>Atrás</b> si ya terminaste con ella.</div>`:""}
       <label class="f"><span>Componente trabajado</span>
         <select id="compSel">
           <option value="">— Selecciona —</option>
@@ -1023,8 +1095,12 @@ function pasoActividades(){
               <span class="nm">${esc(a.nombre)}</span>
               <span class="std">${std?`${std} min${esPorOrden(a.id)?" por orden":"/und"}${origenEstandar(c.tipoComponenteId,c.tipologiaId,a.id)==="reparto"?` · ${repartoDe(c.tipoComponenteId,a.id)}% de la reparación`:""}`:"sin estándar"}</span></div>
             <div class="det">
-              <label><span>Unidades${(()=>{const ya=yaRegistrado(c.id,a.id); const queda=(c.cantidad||0)-ya;
-                return ya? ` <span style="text-transform:none;letter-spacing:0;color:${queda<=0?"var(--red)":"var(--amber)"}">· ya van ${ya} de ${c.cantidad}</span>`:"";})()}</span>
+              <label><span>Unidades${(()=>{
+                const ya=yaRegistrado(c.id,a.id); if(!ya) return "";
+                const queda=(c.cantidad||0)-ya;
+                const quienes=[...new Set(RA().filter(r=>r.componenteId===c.id && r.actividadId===a.id)
+                  .map(r=>nom(DB.tecnicos,r.tecnicoId)))];
+                return ` <span style="text-transform:none;letter-spacing:0;color:${queda<=0?"var(--red)":"var(--amber)"}">· ya van ${ya} de ${c.cantidad}${quienes.length?" · las registró "+esc(quienes.join(", ")):""}${queda>0?" · quedan "+queda:""}</span>`;})()}</span>
                 <input type="number" min="0" step="1" max="${Math.max(0,(c.cantidad||0)-yaRegistrado(c.id,a.id))}" data-cant="${a.id}" value="${cant}"></label>
               ${simple?`
               <label style="flex:1 1 100%;margin-top:2px">
@@ -1109,7 +1185,9 @@ function pRegistro(){
   const $n=$("#nuevaOT"); if($n) $n.onclick=()=>modalOrden(null, R.busca.trim());
   const $cb=$("#crearBuscada"); if($cb) $cb.onclick=()=>modalOrden(null, R.busca.trim());
   const $vt=$("#verTodas"); if($vt) $vt.onchange=e=>{ R.todas=e.target.checked; render(); };
+  const $so=$("#sinOrden"); if($so) $so.onclick=()=>modalSinOrden();
   const $c=$("#compSel"); if($c) $c.onchange=e=>{
+    R.recienGuardado=false;
     if(e.target.value==="__nuevo__"){ modalComponente(R.ordenId); return; }
     R.componenteId=e.target.value||null; R.sel={}; render();
   };
@@ -1180,6 +1258,7 @@ async function guardarRegistro(){
     creado:new Date().toISOString(), creadoPor:YO, historial:[]
   }));
   const ultEstado = R.estadoOrden||"";
+  const otrosComp = DB.componentes.filter(x=>x.ordenId===R.ordenId && x.id!==R.componenteId);
   await commit(()=>{
     DB.registros.push(...nuevos);
     if(ultEstado){
@@ -1188,8 +1267,15 @@ async function guardarRegistro(){
     }
   }, "Registro guardado ✓");
   empujarRegistros().catch(()=>{});
-  R = { paso:1, fecha:R.fecha, ordenId:null, componenteId:null, sel:{}, novedad:"", tipoNovedad:"", busca:"", todas:R.todas, estadoOrden:"" };
-  render();
+  if(otrosComp.length){
+    /* La orden tiene más componentes: se queda en ella para seguir registrando. */
+    R.componenteId=null; R.sel={}; R.novedad=""; R.tipoNovedad=""; R.estadoOrden=""; R.paso=2;
+    R.recienGuardado=true;
+    render();
+  } else {
+    R = { paso:1, fecha:R.fecha, ordenId:null, componenteId:null, sel:{}, novedad:"", tipoNovedad:"", busca:"", todas:R.todas, estadoOrden:"" };
+    render();
+  }
 }
 
 /* =========================================================================
@@ -2264,6 +2350,44 @@ async function modalBuscarOT(){
     document.querySelector("#okB").onclick=cerrarModal;
   }
 }
+/* Tiempo que no pertenece a ninguna orden: aseo, capacitación, mantenimiento
+   de equipos, apoyo a otra sede. Descuenta jornada, no cuenta como producción. */
+function modalSinOrden(){
+  const me=byId(DB.tecnicos,YO); if(!me) return;
+  const opciones=DB.actividades.filter(a=>a.noProductiva)
+    .concat(DB.actividades.filter(a=>!a.noProductiva && /apoyo|capacit|reuni|mantenimiento de equipo/i.test(a.nombre)));
+  const vistas=[...new Map(opciones.map(a=>[a.id,a])).values()];
+  const maxF=hoyISO(), minF=esCoordinador()?"":restarDias(hoyISO(), DB.meta.diasRetro||2);
+  abrirModal("Actividad sin orden", `
+    <p class="hint" style="margin-top:0">Para el tiempo que no es de ninguna OT. No genera horas ganadas:
+    <b>descuenta jornada disponible</b>, así que no te baja la productividad.</p>
+    <label class="f"><span>Fecha</span><input type="date" id="soFecha" value="${R.fecha||hoyISO()}" max="${maxF}" ${minF?`min="${minF}"`:""}></label>
+    <label class="f"><span>¿Qué hiciste?</span><select id="soAct" style="font-size:15px;padding:10px">
+      <option value="">— Selecciona —</option>
+      ${vistas.map(a=>`<option value="${a.id}">${esc(a.nombre)}</option>`).join("")}
+    </select></label>
+    <label class="f"><span>¿Cuántas horas?</span><input type="number" id="soHoras" min="0" step="0.25" placeholder="Ej: 2.5"></label>
+    <label class="f"><span>Cuenta qué hiciste</span><textarea id="soNota" placeholder="Ej: apoyo en el montaje del laboratorio nuevo, revisión de equipos"></textarea></label>
+    <button class="btn primary" id="soOk">Guardar</button>`,
+    d=>{
+      d.querySelector("#soOk").onclick=async()=>{
+        const act=d.querySelector("#soAct").value;
+        const hs=+d.querySelector("#soHoras").value||0;
+        const nota=d.querySelector("#soNota").value.trim();
+        const fecha=d.querySelector("#soFecha").value||hoyISO();
+        if(!act){ toast("Elige la actividad"); return; }
+        if(hs<=0){ toast("Escribe las horas"); return; }
+        cerrarModal();
+        await commit(()=>{
+          DB.registros.push({id:uid("rg"), fecha, tecnicoId:YO, ordenId:null, componenteId:null,
+            cuartoId:me.cuartoId, actividadId:act, cantidad:1, minutos:Math.round(hs*60), minutosStd:0,
+            novedad:nota, tipoNovedad:"", historial:[], creadoPor:YO, sinOrden:true});
+        }, "Guardado ✓");
+        empujarRegistros().catch(()=>{});
+        render();
+      };
+    });
+}
 function modalEnlaceTecnicos(){
   const cx=DB.meta.conexion;
   const base=location.origin+location.pathname;
@@ -2595,7 +2719,8 @@ function mListas(){
         <input type="text" id="pin" value="${esc(DB.meta.pin||"")}" placeholder="vacío = sin clave"></label>
       <div style="flex:0 0 auto;margin-bottom:11px"><button class="btn primary" id="guardarPin">Guardar clave</button></div>
     </div>
-    <p class="hint" style="margin-top:-4px">Se pide al entrar como coordinación y al volver a abrir la app. Evita entradas por descuido; no es seguridad real.
+    <p class="hint" style="margin-top:-4px">Se pide al entrar como coordinación y al volver a abrir la app. Evita entradas por descuido; no es seguridad real.<br>
+    Si hay más de un coordinador y quieres que cada uno tenga la suya, escríbela en la columna <b>Clave</b> de Maestros → Técnicos: esa manda sobre esta.
     ${DB.meta.pin?"":'<br><b style="color:var(--signal)">Ahora mismo cualquiera puede entrar a tu perfil y borrar datos.</b>'}</p>
     </div></div>
 
@@ -4006,7 +4131,8 @@ function modalTecnico(){
       const elegir=async()=>{
         const id=sel.value; if(!id){ toast("Selecciona tu nombre"); return; }
         const t=byId(DB.tecnicos,id);
-        const clave = t.rol==="coordinador" ? (DB.meta.pin||"") : (t.pin||"");
+        /* Coordinación: vale su clave personal si la tiene; si no, la general. */
+        const clave = t.rol==="coordinador" ? (t.pin || DB.meta.pin || "") : (t.pin||"");
         if(clave){
           const p=await pedirTexto("Clave","Clave de "+t.nombre,"","password");
           if(p!==clave){ toast("Clave incorrecta"); return; }

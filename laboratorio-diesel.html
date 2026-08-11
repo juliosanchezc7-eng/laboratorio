@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v11";
+const VERSION_APP = "2026-08-11 · v12";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -2385,7 +2385,7 @@ function modalSinOrden(){
         await commit(()=>{
           DB.registros.push({id:uid("rg"), fecha, tecnicoId:YO, ordenId:null, componenteId:null,
             cuartoId:me.cuartoId, actividadId:act, cantidad:1, minutos:Math.round(hs*60), minutosStd:0,
-            novedad:nota, tipoNovedad:"", historial:[], creadoPor:YO, sinOrden:true});
+            novedad:nota, tipoNovedad:"", historial:[], creadoPor:YO, sinOrden:true, actualizado:new Date().toISOString()});
         }, "Guardado ✓");
         empujarRegistros().catch(()=>{});
         render();
@@ -3688,6 +3688,7 @@ async function empujarRegistros(){
   const cx = DB.meta.conexion;
   if(cx.modo!=="script" || !cx.gsUrl) return;
   DB.meta.registrosSubidos = new Date().toISOString();
+  DB.registros.forEach(r=>{ if(!r.actualizado) r.actualizado=r.anuladoEn||new Date().toISOString(); });
   const cuerpo = JSON.stringify({accion:"registros", registros: DB.registros.map(r=>{
     const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId), a=byId(DB.actividades,r.actividadId);
     return {id:r.id, fecha:r.fecha, semana:semanaDe(r.fecha), tecnico:nom(DB.tecnicos,r.tecnicoId),
@@ -3717,9 +3718,20 @@ async function sincronizar(silencioso){
       DB.meta.conexion = cx;
       if(config && aplicarMaestros(config)) adopto=true;   // maestros más nuevos ganan
       if(filas.length) res = aplicarFilas(filas, cx.mapa);
-      if(registros && registros.length){                   // fusiona por id, nunca duplica
-        const vistos = new Set(DB.registros.map(r=>r.id));
-        registros.forEach(r=>{ if(r && r.id && !vistos.has(r.id)) DB.registros.push(r); });
+      if(registros && registros.length){
+        /* La hoja puede traer varias versiones del mismo registro (cada push
+           agrega una fila). Se queda la más reciente, y las correcciones o
+           anulaciones hechas aquí no se pierden. */
+        const local = new Map(DB.registros.map(r=>[r.id, r]));
+        registros.forEach(r=>{
+          if(!r || !r.id) return;
+          const mio = local.get(r.id);
+          if(!mio){ local.set(r.id, r); return; }
+          const tR = r.actualizado || r.anuladoEn || "";
+          const tL = mio.actualizado || mio.anuladoEn || "";
+          if(tR && tR > tL) local.set(r.id, r);           // el remoto es más nuevo
+        });
+        DB.registros = [...local.values()];
       }
       DB.meta.conexion.remapeado = remapeado;
       DB.meta.conexion.ultimaSync = new Date().toISOString();
@@ -4034,6 +4046,7 @@ async function anularRegistro(id){
   commit(()=>{
     const t=byId(DB.registros,id); if(!t) return;
     t.anulado=true; t.anuladoPor=YO; t.anuladoEn=new Date().toISOString(); t.motivoAnulacion=motivo||"";
+    t.actualizado=new Date().toISOString();
   },"Registro anulado");
 }
 function restaurarRegistro(id){

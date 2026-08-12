@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v17";
+const VERSION_APP = "2026-08-11 · v19";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -1640,7 +1640,7 @@ function vDashboard(){
         const editado=(r.historial||[]).length;
         return `<tr style="${r.anulado?"opacity:.5;text-decoration:line-through":""}">
         <td class="mono">${fmtFecha(r.fecha)}</td><td>${esc(nom(DB.tecnicos,r.tecnicoId))}</td>
-        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"}</td>
+        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?esc(r.compTexto):"—")}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td>
         <td class="num">${hrs(r.minutos)}</td><td class="num">${hrs(r.minutosStd)}</td>
         <td>${r.tipoNovedad?`<span class="chip c-naranja">${esc(r.tipoNovedad)}</span> ${esc(r.novedad||"")}`:""}
@@ -3485,6 +3485,9 @@ function detectarMapa(enc, filasMuestra){
     })[0];
     cols.forEach(i=>{ if(i!==mejor) map[i]="ignorar"; });
   });
+  /* Ajustes que fijó el usuario: se aplican al final y mandan sobre todo. */
+  const fijos=(DB.meta.conexion&&DB.meta.conexion.fijos)||null;
+  if(fijos) enc.forEach((h,i)=>{ const k=sinTildes(String(h||"")); if(fijos[k]) map[i]=fijos[k]; });
   const co=Object.keys(map).filter(i=>map[i]==="ot");
   if(co.length>1){
     const buena = co.find(i=>/^(ot|orden)$/.test(sinTildes(enc[i]).trim()))
@@ -3829,8 +3832,8 @@ async function empujarRegistros(){
   const cuerpo = JSON.stringify({accion:"registros", registros: DB.registros.map(r=>{
     const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId), a=byId(DB.actividades,r.actividadId);
     return {id:r.id, fecha:r.fecha, semana:semanaDe(r.fecha), tecnico:nom(DB.tecnicos,r.tecnicoId),
-      cuarto:nom(DB.cuartos,r.cuartoId), ot:o?o.ot:"", cliente:o?o.cliente:"",
-      componente:c?nom(DB.tiposComponente,c.tipoComponenteId):"", tipologia:c?nom(DB.tipologias,c.tipologiaId,""):"",
+      cuarto:nom(DB.cuartos,r.cuartoId), ot:o?o.ot:(r.otTexto||""), cliente:o?o.cliente:"",
+      componente:c?nom(DB.tiposComponente,c.tipoComponenteId):(r.compTexto||""), tipologia:c?nom(DB.tipologias,c.tipologiaId,""):"",
       actividad:a?a.nombre:"", fase:a?a.fase:"", unidades:r.cantidad,
       minutos:r.minutos, horas:+hrs(r.minutos), minutosStd:r.minutosStd, horasStd:+hrs(r.minutosStd),
       tipoNovedad:r.tipoNovedad||"", novedad:r.novedad||"", crudo:JSON.stringify({
@@ -3847,8 +3850,13 @@ async function sincronizar(silencioso){
   try{
     const {filas, registros, config} = await leerFuente();
     let remapeado=false;
+    if(filas.length) cx.encabezados = filas[0];
     if(filas.length && (!cx.mapa || (cx.mapaVersion!==DETECTOR && !cx.mapaManual))){
       cx.mapa = detectarMapa(filas[0], filas.slice(1,40)); cx.mapaVersion = DETECTOR; remapeado=true;
+    }
+    /* Tus ajustes manuales mandan siempre, se detecte lo que se detecte. */
+    if(filas.length && cx.fijos){
+      filas[0].forEach((h,i)=>{ const k=sinTildes(String(h||"")); if(cx.fijos[k]) cx.mapa[i]=cx.fijos[k]; });
     }
     let res={nOT:0,nAct:0}, adopto=false;
     await commit(()=>{
@@ -3862,7 +3870,15 @@ async function sincronizar(silencioso){
         const local = new Map(DB.registros.map(r=>[r.id, r]));
         registros.forEach(r=>{
           if(!r || !r.id) return;
+          /* Drive guarda la OT y el componente como texto: se recuperan aunque
+             la orden ya no exista en la app. */
+          if(r.ot && !r.otTexto) r.otTexto=String(r.ot);
+          if(r.componente && !r.compTexto) r.compTexto=String(r.componente);
           const mio = local.get(r.id);
+          if(mio){
+            if(!mio.otTexto && r.otTexto) mio.otTexto=r.otTexto;
+            if(!mio.compTexto && r.compTexto) mio.compTexto=r.compTexto;
+          }
           if(!mio){ local.set(r.id, r); return; }
           const tR = r.actualizado || r.anuladoEn || "";
           const tL = mio.actualizado || mio.anuladoEn || "";
@@ -4124,7 +4140,7 @@ function vConexion(){
         ${cx.mapa&&cx.mapaVersion!==DETECTOR?`<div style="border:1px solid #ecd6a4;background:#fdf5e3;color:var(--amber);padding:9px 11px;border-radius:var(--r);margin:12px 0;font-size:13px">
         <b>Tu mapeo es de una versión anterior.</b> ${cx.mapaManual?`Como lo ajustaste a mano, no lo toco solo. Si quieres que reconozca las columnas nuevas (motivo, garantía, fecha entregado), pulsa “Rehacer mapeo”.`:`Se actualizará solo en la próxima sincronización.`}</div>`:""}
       ${cx.mapa?`<button class="btn" id="cxRemap" style="margin-left:8px">Rehacer mapeo de columnas</button>
-        ${cx.mapaManual?`<span class="tag" style="margin-left:8px">mapeo ajustado a mano: no se toca solo</span>`:""}`:""}`:""}
+        ${cx.mapaManual?`<span class="tag" style="margin-left:8px">${Object.keys(cx.fijos||{}).length} columna(s) fijadas por ti: se respetan en cada versión</span>`:""}`:""}`:""}
     </div></div>
 
   ${cx.mapa?`<div class="card"><header><h2>Columnas reconocidas</h2></header><div class="body"><div class="tw"><table>
@@ -4182,10 +4198,17 @@ function pConexion(){
   };
   const lt2=$("#linkTec"); if(lt2) lt2.onclick=()=>modalEnlaceTecnicos();
   const rm=$("#cxRemap"); if(rm) rm.onclick=()=>commit(()=>{ DB.meta.conexion.mapa=null;
-    DB.meta.conexion.mapaManual=false; DB.meta.conexion.mapaVersion=0; },"Se detectará de nuevo al sincronizar");
+    DB.meta.conexion.mapaManual=false; DB.meta.conexion.mapaVersion=0; DB.meta.conexion.fijos=null; },
+    "Se detectará de nuevo al sincronizar");
   document.querySelectorAll("[data-cxmap]").forEach(sel=>sel.onchange=()=>{
     const i=sel.dataset.cxmap, v=sel.value;
     commit(()=>{ DB.meta.conexion.mapa[i]=v; DB.meta.conexion.mapaManual=true;
+      /* Se recuerda por el NOMBRE de la columna, no por su posición: así el
+         ajuste sobrevive a cambios de versión y a que la hoja se mueva. */
+      const cx=DB.meta.conexion;
+      if(!cx.fijos) cx.fijos={};
+      const enc=(cx.encabezados||[])[i];
+      if(enc) cx.fijos[sinTildes(String(enc))]=v;
       DB.meta.conexion.mapaVersion=DETECTOR; },"Mapeo actualizado · quedará fijo");
   });
 }

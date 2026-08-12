@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v19";
+const VERSION_APP = "2026-08-11 · v20";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -627,6 +627,21 @@ function resolverTipo(tipoBase, tokens, usados, cuartoOT){
       if(usados.has(tk)) continue;
       const ok=DB.tipologias.find(x=>!x.tipoComponenteId && coincideTipologia(x,tk));
       if(ok) return {tipo:t, tip:ok, token:tk};
+    }
+  }
+  /* Última oportunidad: cualquier tipología cuyo nombre o alias coincida.
+     Si el usuario ya dijo "esto es una tipología", debe valer siempre. */
+  for(const t of pref){
+    for(const tk of tokens){
+      if(usados.has(tk)) continue;
+      const ok=DB.tipologias.find(x=>coincideTipologia(x,tk));
+      if(ok){
+        const suyo = ok.tipoComponenteId ? byId(DB.tiposComponente,ok.tipoComponenteId) : null;
+        /* si está atada a otro componente de la misma familia, se respeta esa */
+        if(suyo && familiaDe(suyo.nombre)===fam && (!cuartoOT || suyo.cuartoId===cuartoOT))
+          return {tipo:suyo, tip:ok, token:tk};
+        if(!suyo) return {tipo:t, tip:ok, token:tk};
+      }
     }
   }
   /* Nada calzó. Si algún texto apunta a un componente que existe pero está
@@ -1495,15 +1510,18 @@ function pOrdenes(){
       `Órdenes afectadas: ${ords.length}\n\n${muestra}${ords.length>8?`\n  …y ${ords.length-8} más`:""}`,
       "Aplicar a las "+ords.length)) return;
     commitMaestro(()=>{
+      /* Una sola tipología para el texto, sin atarla a un componente: así vale
+         para todos los que la usen y el resolver la encuentra la próxima vez. */
+      let tpGlobal = DB.tipologias.find(x=>!x.tipoComponenteId && coincideTipologia(x,tk))
+                  || DB.tipologias.find(x=>coincideTipologia(x,tk));
+      if(tpGlobal && tpGlobal.tipoComponenteId){
+        /* estaba atada a un componente: se libera para que sirva en cualquiera */
+        tpGlobal.tipoComponenteId="";
+      }
+      if(!tpGlobal) tpGlobal = buscarOCrear("tipologias", tk, {cuartoId:"", tipoComponenteId:""});
       ords.forEach(o=>{
         const cs=DB.componentes.filter(c=>c.ordenId===o.id);
-        cs.forEach(c=>{
-          if(c.tipologiaId) return;
-          const tipo=byId(DB.tiposComponente,c.tipoComponenteId);
-          const tp=buscarTipologia(c.tipoComponenteId, tk)
-            || buscarOCrear("tipologias", tk, {cuartoId: tipo?tipo.cuartoId:"", tipoComponenteId:""});
-          c.tipologiaId=tp.id;
-        });
+        cs.forEach(c=>{ if(!c.tipologiaId) c.tipologiaId=tpGlobal.id; });
         const t=byId(DB.ordenes,o.id);
         if(t){ const q=(t.revisar||[]).filter(x=>x!==tk); t.revisar=q.length?q:null; }
       });
@@ -3677,7 +3695,21 @@ function aplicarFilas(filas, mapa){
       };
       if(libres.length===1 && sinTip.length){ sinTip.forEach(c=>ponerTip(c, libres[0], false)); }
       else if(libres.length && libres.length===sinTip.length){ sinTip.forEach((c,k)=>ponerTip(c, libres[k], true)); }
-      else pendientes.push(...libres);
+      else {
+        /* Un token que YA existe como tipología no es "sin ubicar": el usuario
+           ya dijo qué es. Solo se marcan los que la app no conoce. */
+        pendientes.push(...libres.filter(tk=>!DB.tipologias.some(x=>coincideTipologia(x,tk))));
+      }
+    });
+
+    /* Si algún componente quedó sin tipología y hay un token que la app ya
+       conoce, se le aplica: es lo que el usuario indicó antes. */
+    creados.filter(c=>!c.tipologiaId).forEach(c=>{
+      const txt=(o.tipoTexto||"").split(/[\/;|]+|,/).map(x=>x.trim()).filter(Boolean);
+      for(const tk of txt){
+        const tp=DB.tipologias.find(x=>coincideTipologia(x,tk));
+        if(tp && (!tp.tipoComponenteId || tp.tipoComponenteId===c.tipoComponenteId)){ c.tipologiaId=tp.id; break; }
+      }
     });
 
     /* La hoja manda, pero contando TODAS las filas de esa OT juntas. */

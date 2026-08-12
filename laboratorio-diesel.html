@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v13";
+const VERSION_APP = "2026-08-11 · v14";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -3448,12 +3448,31 @@ function aplicarFilas(filas, mapa){
   if(idx.ot===undefined) return {error:"Falta la columna de OT"};
   const desde = (DB.meta.conexion && DB.meta.conexion.desdeFecha) || "";
   const omitirSF = (DB.meta.conexion.sinFecha||"omitir")==="omitir";
-  let nOT=0,nC=0,nAct=0,omitidas=0,sinFecha=0,porRevisar=0,depurados=0,multi=0,repetidas=0,adoptadas=0;
+  let nOT=0,nC=0,nAct=0,omitidas=0,sinFecha=0,porRevisar=0,depurados=0,multi=0,repetidas=0,adoptadas=0,reasignadas=0;
   const avisos=[];
   const nuevosEstados=[];
+  /* Si el mapeo apunta a un componente que ya no existe (lo borraste o
+     renombraste), se busca el equivalente por el nombre de la columna. */
+  const enc = filas[0]||[];
   const compCols = Object.entries(mapa)
     .filter(([,v])=>String(v).indexOf("comp:")===0)
-    .map(([i,v])=>({i:+i, tipoId:String(v).slice(5)}));
+    .map(([i,v])=>{
+      let tipoId=String(v).slice(5);
+      if(!byId(DB.tiposComponente,tipoId)){
+        const k=sinTildes(String(enc[+i]||""));
+        const buscar=(...fr)=>DB.tiposComponente.find(t=>{const nb=sinTildes(t.nombre); return fr.some(f=>nb.indexOf(f)>=0);});
+        let t=null;
+        if(/riel/.test(k))            t=buscar("riel");
+        else if(/inyect/.test(k))     t=buscar("inyector");
+        else if(/bomba/.test(k))      t=buscar("bomba");
+        else if(/regula/.test(k))     t=buscar("regulador");
+        else if(/turbo/.test(k))      t=buscar("turbo");
+        else if(/microfiltro|filtro/.test(k)) t=buscar("microfiltro","filtro");
+        if(t){ tipoId=t.id; mapa[i]="comp:"+t.id; reasignadas++; }
+      }
+      return {i:+i, tipoId};
+    })
+    .filter(x=>byId(DB.tiposComponente,x.tipoId));
 
   /* La misma OT puede venir en varias filas (una por cuarto). Se agrupan para
      que los componentes se sumen en vez de pisarse. */
@@ -3593,7 +3612,7 @@ function aplicarFilas(filas, mapa){
     if(sobra.length) porRevisar++;
   });
 
-  return {nOT,nC,nAct,omitidas,sinFecha,porRevisar,depurados,multi,repetidas,adoptadas,avisos,
+  return {nOT,nC,nAct,omitidas,sinFecha,porRevisar,depurados,multi,repetidas,adoptadas,reasignadas,avisos,
     nuevosEstados:[...new Set(nuevosEstados)]};
 }
 function importar(){
@@ -3707,8 +3726,8 @@ async function leerFuente(){
   }
   if(cx.modo==="script"){
     if(!cx.gsUrl) throw new Error("Falta la URL del Apps Script");
-    const r = await fetch(cx.gsUrl+(cx.gsUrl.includes("?")?"&":"?")+"accion=leer", {redirect:"follow"});
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    const r = await fetch(cx.gsUrl, {redirect:"follow"});
+    if(!r.ok) throw new Error("HTTP "+r.status+" — revisa la URL del Apps Script en Conexión");
     const j = await r.json();
     if(!j.ok) throw new Error(j.error||"El script respondió con error");
     return {filas: j.filas||[], registros: j.registros||null, config: j.config||null};
@@ -3776,7 +3795,7 @@ async function sincronizar(silencioso){
       DB.meta.conexion.ultimaSync = new Date().toISOString();
       DB.meta.conexion.ultimoError = res && res.error ? res.error : "";
       DB.meta.conexion.ultimoResumen = {filas:(filas.length-1), nOT:res.nOT||0, nAct:res.nAct||0,
-        nC:res.nC||0, omitidas:res.omitidas||0, sinFecha:res.sinFecha||0, multi:res.multi||0, repetidas:res.repetidas||0, adoptadas:res.adoptadas||0, corte:cx.desdeFecha||"",
+        nC:res.nC||0, omitidas:res.omitidas||0, sinFecha:res.sinFecha||0, multi:res.multi||0, repetidas:res.repetidas||0, adoptadas:res.adoptadas||0, reasignadas:res.reasignadas||0, corte:cx.desdeFecha||"",
         nuevosEstados:res.nuevosEstados||[], porRevisar:res.porRevisar||0, depurados:res.depurados||0,
         avisos:res.avisos||[]};
     });
@@ -3970,6 +3989,7 @@ function vConexion(){
         <tr><td>Órdenes actualizadas</td><td class="num mono">${cx.ultimoResumen.nAct}</td></tr>
         <tr><td>Componentes agregados</td><td class="num mono">${cx.ultimoResumen.nC}</td></tr>
         <tr style="background:#fdefe5"><td><b>Omitidas por ser anteriores a ${cx.ultimoResumen.corte?fmtFecha(cx.ultimoResumen.corte):"el corte"}</b></td><td class="num mono"><b>${cx.ultimoResumen.omitidas}</b></td></tr>
+        ${cx.ultimoResumen.reasignadas?`<tr style="background:#eaf1f8"><td>Columnas reconectadas<br><span class="tag">apuntaban a un componente que ya no existía</span></td><td class="num mono">${cx.ultimoResumen.reasignadas}</td></tr>`:""}
         ${cx.ultimoResumen.adoptadas?`<tr style="background:#eaf6ef"><td>Órdenes recuperadas de versiones anteriores<br><span class="tag">se renombraron en vez de duplicarse</span></td><td class="num mono">${cx.ultimoResumen.adoptadas}</td></tr>`:""}
         ${cx.ultimoResumen.repetidas?`<tr><td>Filas adicionales de una OT ya existente<br><span class="tag">sus cantidades se suman a la misma orden</span></td><td class="num mono">${cx.ultimoResumen.repetidas}</td></tr>`:""}
         ${cx.ultimoResumen.multi?`<tr><td>OT que vienen en varias filas<br><span class="tag">sus componentes se suman en una sola orden</span></td><td class="num mono">${cx.ultimoResumen.multi}</td></tr>`:""}

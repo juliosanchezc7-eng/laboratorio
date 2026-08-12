@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v15";
+const VERSION_APP = "2026-08-11 · v17";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -714,12 +714,24 @@ function migrar(){
   /* Registros cuyo componente desapareció por una sincronización anterior:
      se reconectan al componente equivalente de la misma orden. */
   DB.registros.forEach(r=>{
-    if(!r.ordenId || r.sinOrden) return;
+    if(r.sinOrden) return;
+    /* Copia legible: sobrevive aunque la orden o el componente desaparezcan. */
+    if(!r.otTexto && r.ordenId){ const o=byId(DB.ordenes,r.ordenId); if(o){ r.otTexto=o.ot; n++; } }
+    if(!r.compTexto && r.componenteId){ const c=byId(DB.componentes,r.componenteId);
+      if(c){ r.compTexto=nom(DB.tiposComponente,c.tipoComponenteId,""); n++; } }
+    if(!r.ordenId) return;
+    /* Si la orden se recreó con otro id, se reengancha por el número de OT. */
+    if(!byId(DB.ordenes,r.ordenId) && r.otTexto){
+      const o=DB.ordenes.find(x=>x.ot===r.otTexto && (!r.cuartoId || (x.cuartoDeclaradoId||"")===r.cuartoId))
+           || DB.ordenes.find(x=>x.ot===r.otTexto);
+      if(o){ r.ordenId=o.id; n++; }
+    }
     if(r.componenteId && byId(DB.componentes,r.componenteId)) return;
     const cands=DB.componentes.filter(c=>c.ordenId===r.ordenId);
     if(!cands.length) return;
+    const porNombre = r.compTexto ? cands.find(c=>nom(DB.tiposComponente,c.tipoComponenteId)===r.compTexto) : null;
     const mismo = r.cuartoId ? cands.find(c=>c.cuartoId===r.cuartoId) : null;
-    r.componenteId = (mismo||cands[0]).id; n++;
+    r.componenteId = (porNombre||mismo||cands[0]).id; n++;
   });
   /* --- Ordena las actividades: une duplicados exactos y deja la estructura
      de diagnóstico desglosado. Se ejecuta una sola vez. No toca registros:
@@ -1180,8 +1192,8 @@ function hoyDelTecnico(){
       ${regs.length?`<div class="tw" style="margin-top:12px"><table><thead><tr><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Real</th><th class="num">Std</th><th></th></tr></thead><tbody>
       ${regs.map(r=>{
         const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
-        return `<tr><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</td>
-        <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.sinOrden?`<span class="tag">—</span>`:`<span class="tag">ya no existe</span>`)}</td>
+        return `<tr><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td>
+        <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?`${esc(r.compTexto)}`:`<span class="tag">—</span>`)}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td>
         <td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td><td class="num">${hrs(r.minutosStd)}</td>
         <td><button class="btn sm danger" data-delreg="${r.id}">Borrar</button></td></tr>`;
@@ -1269,7 +1281,10 @@ async function guardarRegistro(){
     minutosStd: stdRegistro(c, actId, s.cantidad),
     tiempoMedido: !!s.ajustado,
     estadoNuevo:R.estadoOrden||"", tipoNovedad:R.tipoNovedad||"", novedad:R.novedad||"",
-    creado:new Date().toISOString(), creadoPor:YO, historial:[]
+    creado:new Date().toISOString(), creadoPor:YO, historial:[],
+    actualizado:new Date().toISOString(),
+    otTexto:(byId(DB.ordenes,R.ordenId)||{}).ot||"",
+    compTexto:nom(DB.tiposComponente,c.tipoComponenteId,"")
   }));
   const ultEstado = R.estadoOrden||"";
   const otrosComp = DB.componentes.filter(x=>x.ordenId===R.ordenId && x.id!==R.componenteId);
@@ -1343,7 +1358,7 @@ function vMiSemana(){
     ${rs.length?`<div class="tw"><table><thead><tr><th>Fecha</th><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Horas</th></tr></thead><tbody>
     ${rs.slice().sort((a,b)=>b.fecha.localeCompare(a.fecha)).map(r=>{
       const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
-      return `<tr><td class="mono">${fmtFecha(r.fecha)}</td><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</td>
+      return `<tr><td class="mono">${fmtFecha(r.fecha)}</td><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td>
       <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"} ${c?esc(nom(DB.tipologias,c.tipologiaId,"")):""}</td>
       <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td></tr>`;
     }).join("")}</tbody></table></div>`:`<div class="empty">Sin registros esta semana.</div>`}
@@ -1625,7 +1640,7 @@ function vDashboard(){
         const editado=(r.historial||[]).length;
         return `<tr style="${r.anulado?"opacity:.5;text-decoration:line-through":""}">
         <td class="mono">${fmtFecha(r.fecha)}</td><td>${esc(nom(DB.tecnicos,r.tecnicoId))}</td>
-        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"}</td>
+        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td>
         <td class="num">${hrs(r.minutos)}</td><td class="num">${hrs(r.minutosStd)}</td>
         <td>${r.tipoNovedad?`<span class="chip c-naranja">${esc(r.tipoNovedad)}</span> ${esc(r.novedad||"")}`:""}
@@ -1640,7 +1655,7 @@ function vDashboard(){
     return `<div class="card"><header><h2>Correcciones del período</h2><span class="sub mono">${corr.length}</span></header>
     <div class="body"><div class="tw"><table><thead><tr><th>Registro</th><th>Quién corrigió</th><th>Qué cambió</th></tr></thead><tbody>
     ${corr.map(r=>{ const o=byId(DB.ordenes,r.ordenId); const ult=(r.historial||[]).slice(-1)[0];
-      return `<tr><td class="mono">${fmtFecha(r.fecha)} · OT ${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}<br><span class="tag">${esc(nom(DB.tecnicos,r.tecnicoId))}</span></td>
+      return `<tr><td class="mono">${fmtFecha(r.fecha)} · OT ${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}<br><span class="tag">${esc(nom(DB.tecnicos,r.tecnicoId))}</span></td>
       <td>${esc(nom(DB.tecnicos,r.anulado?r.anuladoPor:(ult?ult.quien:"")))}<br><span class="tag">${r.anulado?esc(r.motivoAnulacion||"sin motivo"):esc(ult?ult.motivo||"sin motivo":"")}</span></td>
       <td class="tag">${r.anulado?"<b>Anulado</b>":esc(ult?ult.cambios:"")}</td></tr>`;
     }).join("")}</tbody></table></div></div></div>`; })()}`;
@@ -2072,7 +2087,7 @@ function vSemanal(){
     ${Object.keys(novs).length?Object.entries(novs).sort((a,b)=>b[1].length-a[1].length).map(([k,v])=>`
       <div style="margin-bottom:11px"><span class="chip c-naranja">${esc(k)}</span> <b class="mono">${v.length}</b>
       <ul style="margin:5px 0 0 18px;padding:0;font-size:13px;color:var(--ink-2)">
-        ${v.slice(0,6).map(r=>{const o=byId(DB.ordenes,r.ordenId);return `<li>OT ${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)} · ${esc(nom(DB.tecnicos,r.tecnicoId))}: ${esc(r.novedad||"sin detalle")}</li>`;}).join("")}
+        ${v.slice(0,6).map(r=>{const o=byId(DB.ordenes,r.ordenId);return `<li>OT ${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))} · ${esc(nom(DB.tecnicos,r.tecnicoId))}: ${esc(r.novedad||"sin detalle")}</li>`;}).join("")}
       </ul></div>`).join(""):`<div class="empty">Semana sin novedades reportadas.</div>`}
   </div></div>`;
 }
@@ -2697,7 +2712,7 @@ function mReparto(){
   const tcSel = MFILTRO.tipo || "*";
   const tipo = tcSel==="*"? null : byId(DB.tiposComponente,tcSel);
   const cuartoRef = tipo? tipo.cuartoId : (DB.cuartos[0]&&DB.cuartos[0].id);
-  const acts = actividadesDe(cuartoRef);
+  const acts = actividadesDe(cuartoRef).filter(a=>!a.noProductiva);
   const todosRp = DB.repartos || (DB.repartos=[]);
   const propios = todosRp.filter(r=>r.tipoComponenteId===tcSel);
   const hereda = tcSel!=="*" && !propios.length;
@@ -2705,48 +2720,77 @@ function mReparto(){
   const pct = id => { const r=vigentes.find(x=>x.actividadId===id); return r? r.porcentaje : 0; };
   const suma = vigentes.reduce((a,r)=>a+(+r.porcentaje||0),0);
   const total = tipo? totalProceso(tipo.id,"*") : 0;
+
+  /* Cada actividad cae en uno de tres grupos, y eso es lo único que hay que entender. */
+  const conPropio=[], enReparto=[], sinNada=[];
+  acts.forEach(a=>{
+    const propio = tipo ? estandarExacto(tipo.id,"*",a.id) : null;
+    const p = pct(a.id);
+    if(propio!=null) conPropio.push({a,min:propio});
+    else if(p>0)     enReparto.push({a,p});
+    else             sinNada.push({a});
+  });
+
+  const filaRep = x => `<tr><td>${esc(x.a.nombre)}</td>
+    <td style="width:96px"><input type="number" min="0" max="100" step="1" data-rp="${x.a.id}" value="${x.p}"></td>
+    <td class="num mono">${total?hrs(Math.round(total*x.p/100))+" h":"—"}</td>
+    <td><button class="btn sm danger" data-rpdel="${x.a.id}">Sacar</button></td></tr>`;
+
   return `<div class="card"><header><h2>Reparto del proceso</h2>
-    <span class="sub mono">suma ${suma}%</span></header>
+    <span class="sub">${suma===100?'<span class="chip c-verde">listo · 100%</span>':suma>100?`<span class="chip c-rojo">te pasaste · ${suma}%</span>`:`<span class="chip c-ambar">falta ${100-suma}%</span>`}</span></header>
   <div class="body">
-    ${DB.registros.length?`<div style="border:1px solid #bcd0e2;background:#eaf1f8;padding:10px 12px;border-radius:var(--r);margin-bottom:14px;font-size:13.5px">
-      <b>Ya hay ${DB.registros.length} registros guardados.</b> Cuando cambies tiempos o repartos, pulsa esto para que los registros viejos usen los valores nuevos.
-      <br><button class="btn sm primary" id="recalcEstd" style="margin-top:8px">Recalcular horas estándar de todos los registros</button></div>`:""}
-    <p class="hint" style="margin-top:0">Tienes un tiempo total por componente (ej. <b>inyector CR = 1 h</b>) y varias personas que hacen partes distintas.
-    Aquí defines qué porcentaje de ese total vale cada paso. Quien lava gana su parte, quien calibra la suya, y la suma de todos es el total. Nunca se duplica.</p>
+    <div style="border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;margin-bottom:14px;font-size:13.5px;line-height:1.55">
+      <b>Qué se hace aquí.</b> Tu tabla dice cuánto vale <b>reparar</b> un componente — por ejemplo,
+      un inyector CR vale 1 hora. Si esa reparación la hacen entre dos personas, esa hora hay que
+      dividirla entre ellas. Aquí decides cómo.<br>
+      <span class="tag">El diagnóstico, el lavado y el alistamiento no entran: ya tienen su propio tiempo en tu tabla.</span>
+    </div>
+
     <div class="row">
-      <label class="f" style="max-width:320px"><span>Reparto de</span><select id="fTipo">
-        <option value="">Proceso general (aplica a lo que no tenga el suyo)</option>
+      <label class="f" style="max-width:340px"><span>¿De qué componente?</span><select id="fTipo">
+        <option value="">Todos los que no tengan uno propio</option>
         ${DB.tiposComponente.map(t=>`<option value="${t.id}" ${tcSel===t.id?"selected":""}>${esc(t.nombre)}${todosRp.some(r=>r.tipoComponenteId===t.id)?" ✓":""}</option>`).join("")}
       </select></label>
       ${tipo?`<div style="flex:0 0 auto;align-self:end;margin-bottom:11px">
-        <span class="tag">Tiempo total cargado: <b class="mono">${total?hrs(total)+" h":"sin definir"}</b></span></div>`:""}
+        <span class="tag">Reparación de este componente: <b class="mono">${total?hrs(total)+" h":"sin definir"}</b></span></div>`:""}
     </div>
+
     ${hereda?`<div style="border:1px solid #bcd0e2;background:#eaf1f8;color:var(--prussian);padding:9px 11px;border-radius:var(--r);margin-bottom:12px;font-size:13px">
-      Este componente usa el <b>proceso general</b>. Si le pones porcentajes propios, dejará de heredarlo.</div>`:""}
-    <div style="height:9px;background:var(--line-2);border-radius:99px;overflow:hidden;margin-bottom:4px">
+      Este componente usa el reparto general. Si le pones porcentajes propios, dejará de heredarlo.</div>`:""}
+
+    <div class="eyebrow" style="margin-bottom:7px">1 · Se reparten la reparación</div>
+    <div style="height:9px;background:var(--line-2);border-radius:99px;overflow:hidden;margin-bottom:8px">
       <i style="display:block;height:100%;width:${Math.min(100,suma)}%;background:${suma===100?"var(--green)":suma>100?"var(--red)":"var(--amber)"}"></i></div>
-    <p class="hint" style="margin-bottom:12px">${(()=>{const conPropio=tipo?acts.filter(a=>estandarExacto(tipo.id,"*",a.id)!=null).length:0;
-      return conPropio?`<b>${conPropio} actividad(es) tienen tiempo propio de tu tabla</b> (diagnóstico, lavado, montaje de cartridge…). Déjalas en <b>0%</b>: no salen del reparto, ya valen lo suyo.<br>`:"";})()}${suma===100?"Reparto completo.":suma>100?`Te pasaste ${suma-100}%: se estarían pagando más horas de las que vale el proceso.`:`Falta ${100-suma}% por asignar: parte del tiempo no se le acredita a nadie.`}</p>
-    <p class="scroll-hint">Desliza la tabla a los lados para ver todas las columnas.</p>
-    <div class="tw"><table class="acc"><thead><tr><th>Actividad</th><th>Fase</th><th class="num">%</th><th class="num">Minutos</th><th>Acciones</th></tr></thead><tbody>
-    ${acts.map(a=>{const p=pct(a.id);
-      const propio = tipo ? estandarExacto(tipo.id,"*",a.id) : null;
-      if(a.noProductiva) return `<tr style="opacity:.6"><td>${esc(a.nombre)}<br><span class="chip c-gris">no productiva</span></td>
-        <td class="tag">${esc(a.fase)}</td><td class="tag" colspan="3">No entra al reparto: no pertenece al proceso de ningún componente. Las horas que se registren aquí <b>descuentan jornada</b> en vez de contar como improductividad.</td></tr>`;
-      return `<tr style="${propio!=null?"background:#f7f9fa":""}"><td>${esc(a.nombre)}${propio!=null?`<br><span class="chip c-verde">tiempo propio: ${propio} min</span>`:""}</td><td class="tag">${esc(a.fase)}</td>
-      <td style="width:92px"><input type="number" min="0" max="100" step="1" data-rp="${a.id}" value="${p}"></td>
-      <td class="num mono">${total&&p?hrs(Math.round(total*p/100))+" h":"—"}</td>
-      <td>${p?`<button class="btn sm danger" data-rpdel="${a.id}">Quitar del reparto</button>`
-              :(propio!=null?`<span class="tag">no lo necesita: ya vale ${propio} min</span>`
-                            :`<span class="tag" style="color:var(--signal)">falta asignarle %</span>`)}</td></tr>`;
-    }).join("")}
-    </tbody></table></div>
-    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn primary" id="rpGuardar">Guardar reparto</button>
-      <button class="btn" id="rpAjustar">Ajustar a 100%</button>
-      <button class="btn warn" id="rpSugerido">Cargar reparto sugerido para TODOS los componentes</button>
-      ${!hereda&&tcSel!=="*"?`<button class="btn" id="rpHeredar">Volver al proceso general</button>`:""}
+    ${enReparto.length?`<div class="tw"><table class="acc"><thead><tr><th>Actividad</th><th class="num">% de la reparación</th><th class="num">Le toca</th><th></th></tr></thead>
+      <tbody>${enReparto.map(filaRep).join("")}</tbody></table></div>`
+      :`<div class="empty">Todavía nadie se reparte la reparación. Agrega alguna abajo.</div>`}
+    <p class="hint" style="margin-top:8px">${suma===100?"<b>Está completo.</b> No hay que hacer nada más aquí."
+      :suma>100?`<b>Se pasa ${suma-100}%:</b> se pagarían más horas de las que vale el proceso. Baja algún porcentaje.`
+      :`<b>Falta ${100-suma}%:</b> parte del tiempo no se le acredita a nadie. Súbelos o usa “Repartir lo que falta”.`}</p>
+
+    ${conPropio.length?`
+    <div class="eyebrow" style="margin:18px 0 7px">2 · Ya tienen su propio tiempo · no van aquí</div>
+    <div class="tw"><table><tbody>${conPropio.map(x=>`<tr>
+      <td>${esc(x.a.nombre)}</td><td class="num mono">${x.min} min/und</td>
+      <td class="tag">sale de tu tabla de tiempos</td></tr>`).join("")}</tbody></table></div>`:""}
+
+    ${sinNada.length?`
+    <div class="eyebrow" style="margin:18px 0 7px">3 · No valen nada todavía</div>
+    <p class="hint" style="margin-top:0">Quien las registre gana <b>cero horas</b>. Dales un % arriba, ponles tiempo en
+    <b>Tiempos estándar</b>, o bórralas en <b>Actividades</b> si no se usan.</p>
+    <div class="tw"><table><tbody>${sinNada.map(x=>`<tr>
+      <td>${esc(x.a.nombre)}</td><td class="tag">${esc(x.a.fase)}</td>
+      <td><button class="btn sm" data-rpadd="${x.a.id}">Meterla al reparto</button></td></tr>`).join("")}</tbody></table></div>`:""}
+
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn primary" id="rpGuardar">Guardar</button>
+      <button class="btn" id="rpAjustar">Repartir lo que falta</button>
+      ${!hereda&&tcSel!=="*"?`<button class="btn" id="rpHeredar">Usar el reparto general</button>`:""}
+      <button class="btn warn" id="rpSugerido">Rehacer el reparto de todos los componentes</button>
     </div>
+    ${DB.registros.length?`<div style="border:1px solid #bcd0e2;background:#eaf1f8;padding:10px 12px;border-radius:var(--r);margin-top:14px;font-size:13.5px">
+      <b>Hay ${DB.registros.length} registros guardados.</b> Si cambiaste algo aquí o en los tiempos, pulsa esto para que tomen los valores nuevos.
+      <br><button class="btn sm primary" id="recalcEstd" style="margin-top:8px">Recalcular las horas de todos los registros</button></div>`:""}
   </div></div>`;
 }
 function mListas(){
@@ -2884,6 +2928,13 @@ function pMaestros(){
       plan.forEach(x=>DB.repartos.push({id:uid("rp"),...x}));
     }, "Reparto cargado para "+Object.keys(porTipo).length+" componentes");
   };
+  document.querySelectorAll("[data-rpadd]").forEach(b=>b.onclick=()=>{
+    const id=b.dataset.rpadd, tc=MFILTRO.tipo||"*";
+    const otros=DB.repartos.filter(r=>r.tipoComponenteId===tc);
+    const suma=otros.reduce((a,r)=>a+(+r.porcentaje||0),0);
+    commitMaestro(()=>{ DB.repartos.push({id:uid("rp"),tipoComponenteId:tc,actividadId:id,porcentaje:Math.max(0,100-suma)}); },
+      "Agregada al reparto");
+  });
   const rpa=$("#rpAjustar");
   if(rpa) rpa.onclick=()=>{
     const inputs=[...document.querySelectorAll("[data-rp]")].filter(i=>+i.value>0);
@@ -4167,7 +4218,7 @@ function modalEditarRegistro(id){
   const acts=DB.actividades.slice().sort((a,b)=>a.orden-b.orden);
   const hist=r.historial||[];
   abrirModal("Corregir registro", `
-    <p class="hint" style="margin-top:0">OT <b class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</b> · ${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.sinOrden?`<span class="tag">—</span>`:`<span class="tag">ya no existe</span>`)} ${esc(c?nom(DB.tipologias,c.tipologiaId,""):"")}</p>
+    <p class="hint" style="margin-top:0">OT <b class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</b> · ${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?`${esc(r.compTexto)}`:`<span class="tag">—</span>`)} ${esc(c?nom(DB.tipologias,c.tipologiaId,""):"")}</p>
     <div class="row">
       <label class="f"><span>Fecha</span><input type="date" id="eFecha" value="${r.fecha}" max="${hoyISO()}"></label>
       <label class="f"><span>Técnico</span><select id="eTec">${DB.tecnicos.map(t=>`<option value="${t.id}" ${r.tecnicoId===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</select></label>

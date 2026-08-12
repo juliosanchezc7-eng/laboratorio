@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v20";
+const VERSION_APP = "2026-08-11 · v22";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -306,9 +306,11 @@ function semilla(){
   const TURBO =["cu_turbo"];
   const actividades=[
     /* --- diagnóstico --- */
-    A("ac_diag","Diagnóstico",1,"Diagnóstico"),
-    A("ac_lavado","Lavado / limpieza",2,"Diagnóstico"),
-    A("ac_informe","Informe técnico",3,"Diagnóstico",null,{porOrden:true}),
+    A("ac_desarme","Desarme",1,"Diagnóstico"),
+    A("ac_test","Prueba en banco",2,"Diagnóstico",["cu_elec"]),
+    A("ac_tobera","Prueba inyector / tobera",3,"Diagnóstico",["cu_unit","cu_mec"]),
+    A("ac_informe","Informe técnico",4,"Diagnóstico",null,{porOrden:true}),
+    A("ac_lavado","Lavado / limpieza",5,"Lavado"),
     /* --- reparación: se reparte el tiempo total --- */
     A("ac_mtto_comp","Mantenimiento del componente",10,"Reparación",BANCOS),
     A("ac_calibra","Calibración en banco",11,"Reparación",["cu_elec"]),
@@ -498,9 +500,10 @@ function cuartoDeTipologia(t){
   return "";
 }
 /* Actividades que aplican a un cuarto. Sin lista de cuartos = aplica a todos. */
+const ORDEN_FASE={"Diagnóstico":1,"Lavado":2,"Reparación":3,"Entrega":4,"Apoyo":5};
 function actividadesDe(cuartoId){
   return DB.actividades.filter(a=>!a.cuartos || !a.cuartos.length || a.cuartos.includes(cuartoId))
-    .sort((a,b)=>a.orden-b.orden);
+    .sort((a,b)=>((ORDEN_FASE[a.fase]||9)-(ORDEN_FASE[b.fase]||9)) || (a.orden||0)-(b.orden||0));
 }
 function esCoordinador(){ const me = YO? byId(DB.tecnicos,YO):null; return !!(me && me.rol==="coordinador"); }
 /* Los registros nunca se borran: se anulan y quedan con rastro. RA() son los que cuentan. */
@@ -871,7 +874,110 @@ function migrar(){
       n++;
     }
   }
-  DB.meta.version=7;
+  /* --- Estructura definitiva de Electrónico y los bancos:
+     DIAGNÓSTICO (desarme + montaje a banco + informe) · LAVADO · REPARACIÓN
+     (armado + calibración mecánica + calibración en banco) · ALISTAMIENTO --- */
+  if((DB.meta.version||0) < 8){
+    const norm=x=>sinTildes(x).replace(/[^a-z0-9 ]/g," ").replace(/\s+/g," ").trim();
+    const BANCOS=["cu_elec","cu_unit","cu_mec"];
+    const canon=[
+      {id:"ac_diag",     nombre:"Diagnóstico",           fase:"Diagnóstico", cuartos:[],
+       alias:["desarme","prueba en banco","montaje a banco","prueba inicial","diagnostico"]},
+      {id:"ac_lavado",   nombre:"Lavado / limpieza",     fase:"Diagnóstico", cuartos:[], alias:["lavado","limpieza"]},
+      {id:"ac_informe",  nombre:"Informe técnico",       fase:"Diagnóstico", cuartos:[], alias:["informe","cotizacion"], porOrden:true},
+      {id:"ac_armado",   nombre:"Armado",                fase:"Reparación",  cuartos:BANCOS,
+       alias:["armado","mantenimiento del componente","mantenimiento componente","cambio de repuestos"]},
+      {id:"ac_calibra_m",nombre:"Calibración mecánica",  fase:"Reparación",  cuartos:BANCOS,
+       alias:["calibracion mecanica","calibracion componente"]},
+      {id:"ac_calibra",  nombre:"Calibración en banco",  fase:"Reparación",  cuartos:["cu_elec"],
+       alias:["calibracion en banco","calibracion"]},
+      {id:"ac_calibra_t",nombre:"Calibración en tester", fase:"Reparación",  cuartos:["cu_unit","cu_mec"], alias:["calibracion en tester"]},
+      {id:"ac_alist",    nombre:"Alistamiento y entrega",fase:"Entrega",     cuartos:[], alias:["alistamiento","empaque y entrega"]}
+    ];
+    const intocables=new Set(DB.actividades.filter(a=>
+      (a.cuartos||[]).indexOf("cu_turbo")>=0 || a.noProductiva).map(a=>a.id));
+    const ids={};
+    canon.forEach(c=>{
+      let d=DB.actividades.find(a=>a.id===c.id) ||
+            DB.actividades.find(a=>!intocables.has(a.id) && norm(a.nombre)===norm(c.nombre));
+      if(!d){ d={id:c.id,nombre:c.nombre,orden:1,fase:c.fase,cuartos:c.cuartos,noProductiva:false,porOrden:!!c.porOrden};
+        DB.actividades.push(d); n++; }
+      d.nombre=c.nombre; d.fase=c.fase; d.cuartos=c.cuartos; d.porOrden=!!c.porOrden; d.noProductiva=false;
+      ids[c.id]=d.id;
+      DB.actividades.filter(a=>a.id!==d.id && !intocables.has(a.id) && c.alias.indexOf(norm(a.nombre))>=0)
+        .forEach(v=>{
+          DB.registros.forEach(r=>{ if(r.actividadId===v.id) r.actividadId=d.id; });
+          DB.estandares.forEach(e=>{ if(e.actividadId===v.id) e.actividadId=d.id; });
+          DB.repartos=DB.repartos.filter(r=>r.actividadId!==v.id);
+          DB.actividades=DB.actividades.filter(a=>a.id!==v.id); n++;
+        });
+    });
+    /* el diagnóstico vuelve a ser UNA actividad con su tiempo completo */
+    DB.tiposComponente.forEach(t=>{
+      const dg=DB.estandares.filter(e=>e.tipoComponenteId===t.id && e.actividadId===ids.ac_diag);
+      if(dg.length>1){ const suma=dg.reduce((a,e)=>a+e.minutos,0);
+        DB.estandares=DB.estandares.filter(e=>!(e.tipoComponenteId===t.id && e.actividadId===ids.ac_diag));
+        DB.estandares.push({id:uid("es"),tipoComponenteId:t.id,tipologiaId:"*",actividadId:ids.ac_diag,minutos:suma}); n++; }
+    });
+    /* reparto de la hora: armado, calibración mecánica y calibración en banco */
+    const turbo=DB.tiposComponente.find(t=>familiaDe(t.nombre)==="turbo");
+    const rpTurbo=DB.repartos.filter(r=>turbo && r.tipoComponenteId===turbo.id);
+    DB.repartos=rpTurbo.concat([
+      {id:uid("rp"),tipoComponenteId:"*",actividadId:ids.ac_armado,porcentaje:40},
+      {id:uid("rp"),tipoComponenteId:"*",actividadId:ids.ac_calibra_m,porcentaje:25},
+      {id:uid("rp"),tipoComponenteId:"*",actividadId:ids.ac_calibra,porcentaje:35}
+    ]);
+    ["cu_unit","cu_mec"].forEach(cu=>{
+      DB.tiposComponente.filter(t=>t.cuartoId===cu).forEach(t=>{
+        DB.repartos.push({id:uid("rp"),tipoComponenteId:t.id,actividadId:ids.ac_armado,porcentaje:40});
+        DB.repartos.push({id:uid("rp"),tipoComponenteId:t.id,actividadId:ids.ac_calibra_m,porcentaje:25});
+        DB.repartos.push({id:uid("rp"),tipoComponenteId:t.id,actividadId:ids.ac_calibra_t,porcentaje:35});
+      });
+    });
+    n++;
+  }
+  /* --- Lavado pasa a ser su propia fase; el diagnóstico se abre en
+     desarme + prueba en banco + informe, y su tiempo se reparte. --- */
+  if((DB.meta.version||0) < 9){
+    const norm=x=>sinTildes(x).replace(/[^a-z0-9 ]/g," ").replace(/\s+/g," ").trim();
+    const buscar=nb=>DB.actividades.find(a=>norm(a.nombre)===norm(nb));
+    const lav=buscar("Lavado / limpieza"); if(lav) lav.fase="Lavado";
+    const diag=buscar("Diagnóstico");
+    const crear=(nombre,fase,cuartos,extra)=>{
+      let a=buscar(nombre);
+      if(!a){ a={id:uid("ac"),nombre,orden:1,fase,cuartos:cuartos||[],noProductiva:false,porOrden:false};
+        DB.actividades.push(a); n++; }
+      a.fase=fase; a.cuartos=cuartos||[]; Object.assign(a, extra||{});
+      return a;
+    };
+    const des=crear("Desarme","Diagnóstico",[]);
+    const test=crear("Prueba en banco","Diagnóstico",["cu_elec"]);
+    const tob=crear("Prueba inyector / tobera","Diagnóstico",["cu_unit","cu_mec"]);
+    const inf=crear("Informe técnico","Diagnóstico",[],{porOrden:true});
+    /* el tiempo del diagnóstico se convierte en el reparto de sus tres pasos */
+    if(diag){
+      DB.tiposComponente.forEach(t=>{
+        const e=DB.estandares.find(x=>x.tipoComponenteId===t.id && x.actividadId===diag.id);
+        if(!e) return;
+        const prueba = /electronico/.test(sinTildes(nom(DB.cuartos,t.cuartoId))) ? test : tob;
+        const total=e.minutos;
+        DB.estandares=DB.estandares.filter(x=>x!==e);
+        /* desarme 40% · prueba 45% · informe 15%, redondeando al total */
+        const d=Math.round(total*0.40), p=Math.round(total*0.45), i=total-d-p;
+        if(d) DB.estandares.push({id:uid("es"),tipoComponenteId:t.id,tipologiaId:"*",actividadId:des.id,minutos:d});
+        if(p) DB.estandares.push({id:uid("es"),tipoComponenteId:t.id,tipologiaId:"*",actividadId:prueba.id,minutos:p});
+        if(i>0 && !DB.estandares.some(x=>x.tipoComponenteId===t.id && x.actividadId===inf.id))
+          DB.estandares.push({id:uid("es"),tipoComponenteId:t.id,tipologiaId:"*",actividadId:inf.id,minutos:i});
+        n++;
+      });
+      /* los registros que usaban "Diagnóstico" pasan al desarme */
+      DB.registros.forEach(r=>{ if(r.actividadId===diag.id){ r.actividadId=des.id; n++; } });
+      DB.actividades=DB.actividades.filter(a=>a.id!==diag.id);
+      DB.repartos=DB.repartos.filter(r=>r.actividadId!==diag.id);
+    }
+    n++;
+  }
+  DB.meta.version=9;
   return n;
 }
 async function cargar(){
@@ -1123,7 +1229,7 @@ function pasoActividades(){
         Estás registrando en <b>${esc(nom(DB.cuartos,c.cuartoId))}</b>, que no es tu cuarto base.
         Las horas se te acreditan a ti; la producción, a ${esc(nom(DB.cuartos,c.cuartoId))}.</div>`:""}
       <div class="eyebrow" style="margin:14px 0 7px">Actividades de ${esc(nom(DB.cuartos,c.cuartoId))} · marca las que realizaste</div>
-      ${["Diagnóstico","Reparación","Entrega","Apoyo"].map(fase=>{
+      ${["Diagnóstico","Lavado","Reparación","Entrega","Apoyo"].map(fase=>{
         const grupo = acts.filter(a=>a.fase===fase);
         if(!grupo.length) return "";
         const simple = (DB.meta.capturaTiempo||"simple")==="simple";
@@ -2235,7 +2341,7 @@ function mActividades(){
   ${lista.map(a=>`<tr>
   <td style="width:78px"><input type="number" data-fld="actividades.${a.id}.orden" value="${a.orden}"></td>
   <td><input type="text" data-fld="actividades.${a.id}.nombre" value="${esc(a.nombre)}"></td>
-  <td><select data-fld="actividades.${a.id}.fase">${["Diagnóstico","Reparación","Entrega","Apoyo"].map(f=>`<option ${a.fase===f?"selected":""}>${f}</option>`).join("")}</select></td>
+  <td><select data-fld="actividades.${a.id}.fase">${["Diagnóstico","Lavado","Reparación","Entrega","Apoyo"].map(f=>`<option ${a.fase===f?"selected":""}>${f}</option>`).join("")}</select></td>
   <td><select data-fld="actividades.${a.id}.porOrden">
     <option value="" ${!a.porOrden?"selected":""}>Por unidad</option>
     <option value="1" ${a.porOrden?"selected":""}>Una vez por orden</option></select></td>
@@ -2663,7 +2769,7 @@ function mEstandares(){
     <optgroup label="Sugeridas">${tipologiasDe(e.tipoComponenteId).map(t=>`<option value="${t.id}" ${e.tipologiaId===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</optgroup>
     <optgroup label="Otras">${tipologiasOtras(e.tipoComponenteId).map(t=>`<option value="${t.id}" ${e.tipologiaId===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</optgroup></select></td>
   <td><select data-fld="estandares.${e.id}.actividadId">
-    <option value="${ACT_TOTAL}" ${e.actividadId===ACT_TOTAL?"selected":""}>★ TIEMPO TOTAL (todo el proceso, se reparte)</option>
+    <option value="${ACT_TOTAL}" ${e.actividadId===ACT_TOTAL?"selected":""}>★ REPARACIÓN — se reparte entre sus actividades</option>
     ${actsOk.map(a=>`<option value="${a.id}" ${e.actividadId===a.id?"selected":""}>${esc(a.nombre)}</option>`).join("")}</select></td>
   <td style="width:96px"><input type="number" data-fld="estandares.${e.id}.minutos" value="${e.minutos}"></td>
   <td><button class="btn sm danger" data-del="estandares.${e.id}">Eliminar</button></td></tr>`;}).join("")}

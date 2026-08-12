@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v14";
+const VERSION_APP = "2026-08-11 · v15";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -3414,6 +3414,26 @@ function detectarMapa(enc, filasMuestra){
   }
   /* Si más de una columna quedó como Estado, se conserva la que diga "estado real"
      (o la primera). Las otras se ignoran: una columna de cumplimiento no es un estado. */
+  /* Dos columnas no pueden alimentar el mismo componente: la de nombre más
+     parecido se queda con él, la otra se ignora hasta que la asignes a mano. */
+  const porComp={};
+  Object.keys(map).forEach(i=>{
+    const v=String(map[i]);
+    if(v.indexOf("comp:")!==0) return;
+    const id=v.slice(5);
+    if(!porComp[id]) porComp[id]=[];
+    porComp[id].push(i);
+  });
+  Object.entries(porComp).forEach(([id,cols])=>{
+    if(cols.length<2) return;
+    const t=byId(DB.tiposComponente,id); const nb=t?sinTildes(t.nombre):"";
+    const mejor=cols.slice().sort((a,b)=>{
+      const ka=sinTildes(String(enc[a]||"")), kb=sinTildes(String(enc[b]||""));
+      const pa=nb.indexOf(ka.replace(/[^a-z]/g,""))>=0?0:1, pb=nb.indexOf(kb.replace(/[^a-z]/g,""))>=0?0:1;
+      return pa-pb;
+    })[0];
+    cols.forEach(i=>{ if(i!==mejor) map[i]="ignorar"; });
+  });
   const co=Object.keys(map).filter(i=>map[i]==="ot");
   if(co.length>1){
     const buena = co.find(i=>/^(ot|orden)$/.test(sinTildes(enc[i]).trim()))
@@ -3449,6 +3469,7 @@ function aplicarFilas(filas, mapa){
   const desde = (DB.meta.conexion && DB.meta.conexion.desdeFecha) || "";
   const omitirSF = (DB.meta.conexion.sinFecha||"omitir")==="omitir";
   let nOT=0,nC=0,nAct=0,omitidas=0,sinFecha=0,porRevisar=0,depurados=0,multi=0,repetidas=0,adoptadas=0,reasignadas=0;
+  const sinComponente=[];
   const avisos=[];
   const nuevosEstados=[];
   /* Si el mapeo apunta a un componente que ya no existe (lo borraste o
@@ -3468,7 +3489,12 @@ function aplicarFilas(filas, mapa){
         else if(/regula/.test(k))     t=buscar("regulador");
         else if(/turbo/.test(k))      t=buscar("turbo");
         else if(/microfiltro|filtro/.test(k)) t=buscar("microfiltro","filtro");
+        /* no reutilizar un componente que ya tiene su propia columna */
+        const ocupados=new Set(Object.entries(mapa)
+          .filter(([j,v])=>+j!==+i && String(v).indexOf("comp:")===0).map(([,v])=>String(v).slice(5)));
+        if(t && ocupados.has(t.id)) t=null;
         if(t){ tipoId=t.id; mapa[i]="comp:"+t.id; reasignadas++; }
+        else { mapa[i]="ignorar"; sinComponente.push(String(enc[+i]||"columna "+(+i+1))); }
       }
       return {i:+i, tipoId};
     })
@@ -3612,6 +3638,8 @@ function aplicarFilas(filas, mapa){
     if(sobra.length) porRevisar++;
   });
 
+  if(sinComponente.length) avisos.push("Estas columnas quedaron sin componente porque no existe uno equivalente: "+
+    [...new Set(sinComponente)].join(", ")+". Créalos en Maestros → Tipos de componente y asígnalos en Probar conexión.");
   return {nOT,nC,nAct,omitidas,sinFecha,porRevisar,depurados,multi,repetidas,adoptadas,reasignadas,avisos,
     nuevosEstados:[...new Set(nuevosEstados)]};
 }

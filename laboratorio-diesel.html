@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v12";
+const VERSION_APP = "2026-08-11 · v13";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -711,6 +711,16 @@ function migrar(){
   DB.actividades.forEach(a=>{ if(!Array.isArray(a.cuartos)){a.cuartos=[];n++;} });
   DB.tipologias.forEach(t=>{ if(t.cuartoId===undefined){t.cuartoId="";n++;} if(t.tipoComponenteId===undefined){t.tipoComponenteId="";n++;} if(t.alias===undefined){t.alias="";n++;} });
   DB.registros.forEach(r=>{ if(!Array.isArray(r.historial)){r.historial=[];n++;} });
+  /* Registros cuyo componente desapareció por una sincronización anterior:
+     se reconectan al componente equivalente de la misma orden. */
+  DB.registros.forEach(r=>{
+    if(!r.ordenId || r.sinOrden) return;
+    if(r.componenteId && byId(DB.componentes,r.componenteId)) return;
+    const cands=DB.componentes.filter(c=>c.ordenId===r.ordenId);
+    if(!cands.length) return;
+    const mismo = r.cuartoId ? cands.find(c=>c.cuartoId===r.cuartoId) : null;
+    r.componenteId = (mismo||cands[0]).id; n++;
+  });
   /* --- Ordena las actividades: une duplicados exactos y deja la estructura
      de diagnóstico desglosado. Se ejecuta una sola vez. No toca registros:
      los traslada a la actividad que se conserva. --- */
@@ -1170,8 +1180,8 @@ function hoyDelTecnico(){
       ${regs.length?`<div class="tw" style="margin-top:12px"><table><thead><tr><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Real</th><th class="num">Std</th><th></th></tr></thead><tbody>
       ${regs.map(r=>{
         const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
-        return `<tr><td class="mono">${esc(o?o.ot:"—")}</td>
-        <td>${esc(c?nom(DB.tiposComponente,c.tipoComponenteId):"—")}</td>
+        return `<tr><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</td>
+        <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.sinOrden?`<span class="tag">—</span>`:`<span class="tag">ya no existe</span>`)}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td>
         <td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td><td class="num">${hrs(r.minutosStd)}</td>
         <td><button class="btn sm danger" data-delreg="${r.id}">Borrar</button></td></tr>`;
@@ -1333,7 +1343,7 @@ function vMiSemana(){
     ${rs.length?`<div class="tw"><table><thead><tr><th>Fecha</th><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Horas</th></tr></thead><tbody>
     ${rs.slice().sort((a,b)=>b.fecha.localeCompare(a.fecha)).map(r=>{
       const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
-      return `<tr><td class="mono">${fmtFecha(r.fecha)}</td><td class="mono">${esc(o?o.ot:"—")}</td>
+      return `<tr><td class="mono">${fmtFecha(r.fecha)}</td><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</td>
       <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"} ${c?esc(nom(DB.tipologias,c.tipologiaId,"")):""}</td>
       <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td></tr>`;
     }).join("")}</tbody></table></div>`:`<div class="empty">Sin registros esta semana.</div>`}
@@ -1406,7 +1416,7 @@ function vOrdenes(){
             return `<div class="gauge" style="margin:0"><i class="${av>=100?"ok":av>=50?"warn":""}" style="width:${av}%"></i></div>
             <span class="tag">${av}% del proceso</span>`;})()}</td>
           <td class="num">${hrs(min)}</td>
-          <td><button class="btn sm" data-edot="${o.id}">Editar</button></td></tr>`;
+          <td>${DB.meta.conexion.modo?`<button class="btn sm" data-rehacer="${esc(o.ot)}">Rehacer</button>`:""}<button class="btn sm" data-edot="${o.id}">Editar</button></td></tr>`;
       }).join("")}</tbody></table></div>`:`<div class="empty">Sin órdenes que coincidan.</div>`}
     </div>
   </div>`;
@@ -1494,6 +1504,7 @@ function pOrdenes(){
   });
   $("#addOT").onclick=()=>modalOrden();
   document.querySelectorAll("[data-edot]").forEach(b=>b.onclick=()=>modalOrden(b.dataset.edot));
+  document.querySelectorAll("[data-rehacer]").forEach(b=>b.onclick=()=>rehacerOrden(b.dataset.rehacer));
 }
 
 /* =========================================================================
@@ -1614,7 +1625,7 @@ function vDashboard(){
         const editado=(r.historial||[]).length;
         return `<tr style="${r.anulado?"opacity:.5;text-decoration:line-through":""}">
         <td class="mono">${fmtFecha(r.fecha)}</td><td>${esc(nom(DB.tecnicos,r.tecnicoId))}</td>
-        <td class="mono">${esc(o?o.ot:"—")}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"}</td>
+        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td>
         <td class="num">${hrs(r.minutos)}</td><td class="num">${hrs(r.minutosStd)}</td>
         <td>${r.tipoNovedad?`<span class="chip c-naranja">${esc(r.tipoNovedad)}</span> ${esc(r.novedad||"")}`:""}
@@ -1629,7 +1640,7 @@ function vDashboard(){
     return `<div class="card"><header><h2>Correcciones del período</h2><span class="sub mono">${corr.length}</span></header>
     <div class="body"><div class="tw"><table><thead><tr><th>Registro</th><th>Quién corrigió</th><th>Qué cambió</th></tr></thead><tbody>
     ${corr.map(r=>{ const o=byId(DB.ordenes,r.ordenId); const ult=(r.historial||[]).slice(-1)[0];
-      return `<tr><td class="mono">${fmtFecha(r.fecha)} · OT ${esc(o?o.ot:"—")}<br><span class="tag">${esc(nom(DB.tecnicos,r.tecnicoId))}</span></td>
+      return `<tr><td class="mono">${fmtFecha(r.fecha)} · OT ${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}<br><span class="tag">${esc(nom(DB.tecnicos,r.tecnicoId))}</span></td>
       <td>${esc(nom(DB.tecnicos,r.anulado?r.anuladoPor:(ult?ult.quien:"")))}<br><span class="tag">${r.anulado?esc(r.motivoAnulacion||"sin motivo"):esc(ult?ult.motivo||"sin motivo":"")}</span></td>
       <td class="tag">${r.anulado?"<b>Anulado</b>":esc(ult?ult.cambios:"")}</td></tr>`;
     }).join("")}</tbody></table></div></div></div>`; })()}`;
@@ -2061,7 +2072,7 @@ function vSemanal(){
     ${Object.keys(novs).length?Object.entries(novs).sort((a,b)=>b[1].length-a[1].length).map(([k,v])=>`
       <div style="margin-bottom:11px"><span class="chip c-naranja">${esc(k)}</span> <b class="mono">${v.length}</b>
       <ul style="margin:5px 0 0 18px;padding:0;font-size:13px;color:var(--ink-2)">
-        ${v.slice(0,6).map(r=>{const o=byId(DB.ordenes,r.ordenId);return `<li>OT ${esc(o?o.ot:"—")} · ${esc(nom(DB.tecnicos,r.tecnicoId))}: ${esc(r.novedad||"sin detalle")}</li>`;}).join("")}
+        ${v.slice(0,6).map(r=>{const o=byId(DB.ordenes,r.ordenId);return `<li>OT ${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)} · ${esc(nom(DB.tecnicos,r.tecnicoId))}: ${esc(r.novedad||"sin detalle")}</li>`;}).join("")}
       </ul></div>`).join(""):`<div class="empty">Semana sin novedades reportadas.</div>`}
   </div></div>`;
 }
@@ -2294,6 +2305,34 @@ async function modalAuditar(){
       <button class="btn" id="okA" style="margin-top:11px">Cerrar</button>`);
     document.querySelector("#okA").onclick=cerrarModal;
   }
+}
+/* Vuelve a leer una OT de la hoja y rehace SUS componentes desde cero.
+   Sirve cuando quedaron mal de sincronizaciones anteriores. */
+async function rehacerOrden(ot){
+  const cx=DB.meta.conexion;
+  if(!cx.modo){ toast("Configura primero la conexión"); return; }
+  try{
+    toast("Leyendo la hoja…");
+    const {filas}=await leerFuente();
+    const mapa=cx.mapa||detectarMapa(filas[0]);
+    const idx={}; Object.entries(mapa).forEach(([i,c])=>{ if(c!=="ignorar") idx[c]=+i; });
+    const hits=filas.slice(1).filter(f=>String(f[idx.ot]||"").trim()===String(ot).trim());
+    if(!hits.length){ toast("Esa OT no está en la hoja"); return; }
+    const conRegistro=DB.componentes.filter(c=>{
+      const o=byId(DB.ordenes,c.ordenId); return o && o.ot===ot && DB.registros.some(r=>r.componenteId===c.id);
+    });
+    if(!await confirmar("Rehacer la orden "+ot,
+      `Se borran sus componentes y se vuelven a crear leyendo la hoja.\n\n`+
+      (conRegistro.length? `${conRegistro.length} componente(s) tienen producción registrada y NO se tocan.\n\n`:"")+
+      `Úsalo cuando la orden quedó mal de una sincronización anterior.`,"Rehacer")) return;
+    await commit(()=>{
+      const proteger=new Set(conRegistro.map(c=>c.id));
+      const ordIds=DB.ordenes.filter(o=>o.ot===ot).map(o=>o.id);
+      DB.componentes=DB.componentes.filter(c=>!ordIds.includes(c.ordenId) || proteger.has(c.id));
+      aplicarFilas([filas[0], ...hits], mapa);
+    }, "Orden "+ot+" rehecha");
+    render();
+  }catch(e){ toast("No se pudo: "+(e.message||e)); }
 }
 async function modalBuscarOT(){
   const txt = await pedirTexto("Rastrear una OT","Escribe el número de OT tal como está en la hoja","");
@@ -3913,6 +3952,7 @@ function vConexion(){
     <span class="sub mono">${cx.modo?("último: "+(cx.ultimaSync?new Date(cx.ultimaSync).toLocaleString():"nunca")):"sin configurar"}</span>
     <div class="push">${cx.modo?`<button class="btn sm primary" id="auditarCx">Auditar cantidades</button>
       <button class="btn sm" id="rastrearOT">Rastrear una OT</button>
+      <button class="btn sm warn" id="rehacerTodo">Rehacer componentes</button>
       <button class="btn sm" id="depurarCx">Depurar órdenes</button>
       <button class="btn sm" id="probarCx">Probar conexión</button>
       <button class="btn primary sm" id="syncYa">Sincronizar ahora</button>`:""}</div></header>
@@ -4021,6 +4061,26 @@ function pConexion(){
   const dp=$("#depurarCx"); if(dp) dp.onclick=()=>depurarOrdenes();
   const ro=$("#rastrearOT"); if(ro) ro.onclick=()=>modalBuscarOT();
   const au=$("#auditarCx"); if(au) au.onclick=()=>modalAuditar();
+  const rt=$("#rehacerTodo");
+  if(rt) rt.onclick=async()=>{
+    if(!await confirmar("Rehacer todos los componentes",
+      "Se borran los componentes SIN producción registrada y se vuelven a crear leyendo la hoja completa.\n\n"+
+      "Los que tienen horas de algún técnico no se tocan.\n\nÚsalo si varias órdenes quedaron con componentes equivocados.","Rehacer todo")) return;
+    try{
+      toast("Leyendo la hoja…");
+      const {filas}=await leerFuente();
+      const cx=DB.meta.conexion, mapa=cx.mapa||detectarMapa(filas[0]);
+      let borrados=0;
+      await commit(()=>{
+        const conProd=new Set(DB.componentes.filter(c=>DB.registros.some(r=>r.componenteId===c.id)).map(c=>c.id));
+        const antes=DB.componentes.length;
+        DB.componentes=DB.componentes.filter(c=>conProd.has(c.id) || c.origen==="manual");
+        borrados=antes-DB.componentes.length;
+        aplicarFilas(filas, mapa);
+      }, `Listo · ${borrados} componentes rehechos`);
+      render();
+    }catch(e){ toast("No se pudo: "+(e.message||e)); }
+  };
   const lt2=$("#linkTec"); if(lt2) lt2.onclick=()=>modalEnlaceTecnicos();
   const rm=$("#cxRemap"); if(rm) rm.onclick=()=>commit(()=>{ DB.meta.conexion.mapa=null;
     DB.meta.conexion.mapaManual=false; DB.meta.conexion.mapaVersion=0; },"Se detectará de nuevo al sincronizar");
@@ -4059,7 +4119,7 @@ function modalEditarRegistro(id){
   const acts=DB.actividades.slice().sort((a,b)=>a.orden-b.orden);
   const hist=r.historial||[];
   abrirModal("Corregir registro", `
-    <p class="hint" style="margin-top:0">OT <b class="mono">${esc(o?o.ot:"—")}</b> · ${esc(c?nom(DB.tiposComponente,c.tipoComponenteId):"—")} ${esc(c?nom(DB.tipologias,c.tipologiaId,""):"")}</p>
+    <p class="hint" style="margin-top:0">OT <b class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:`<span class="chip c-naranja">se perdió el vínculo</span>`)}</b> · ${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.sinOrden?`<span class="tag">—</span>`:`<span class="tag">ya no existe</span>`)} ${esc(c?nom(DB.tipologias,c.tipologiaId,""):"")}</p>
     <div class="row">
       <label class="f"><span>Fecha</span><input type="date" id="eFecha" value="${r.fecha}" max="${hoyISO()}"></label>
       <label class="f"><span>Técnico</span><select id="eTec">${DB.tecnicos.map(t=>`<option value="${t.id}" ${r.tecnicoId===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</select></label>

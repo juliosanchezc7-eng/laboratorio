@@ -5102,6 +5102,19 @@ function modalEditarRegistro(id){
   const hist=r.historial||[];
   abrirModal("Corregir registro", `
     <p class="hint" style="margin-top:0">OT <b class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</b> · ${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?`${esc(r.compTexto)}`:`<span class="tag">—</span>`)} ${esc(c?nom(DB.tipologias,c.tipologiaId,""):"")}</p>
+    <details ${(o&&c)?"":"open"} style="margin-bottom:11px;border:1px solid var(--line);border-radius:var(--r);padding:9px 11px">
+      <summary style="cursor:pointer;font-size:13px;font-weight:600">Orden y componente${(o&&c)?"":' <span class="chip c-naranja">falta</span>'}</summary>
+      <p class="hint" style="margin-top:7px">Escribe el número de OT y elige el componente. Al guardar se recalculan las horas ganadas.<br>Si el componente no aparece, usa <b>+ Agregar componente a esta OT</b>: el corrector se recarga, así que guarda antes cualquier otro cambio.</p>
+      <div class="row">
+        <label class="f"><span>Número de OT</span>
+          <input type="text" id="eOT" list="eOTlista" value="${esc(o?o.ot:(r.otTexto||""))}" placeholder="Ej: 34390">
+          <datalist id="eOTlista">${[...new Set(DB.ordenes.map(x=>x.ot))].slice(0,600).map(x=>`<option value="${esc(x)}">`).join("")}</datalist></label>
+        <label class="f"><span>Componente</span><select id="eComp"><option value="">— busca la OT primero —</option></select></label>
+      </div>
+      <label style="font-size:13px;display:block;margin-top:4px;cursor:pointer">
+        <input type="checkbox" id="eSinOrden" ${r.sinOrden?"checked":""} style="vertical-align:-2px">
+        Este trabajo no tiene orden (apoyo, montaje, otra sede)</label>
+    </details>
     <div class="row">
       <label class="f"><span>Fecha</span><input type="date" id="eFecha" value="${r.fecha}" max="${hoyISO()}"></label>
       <label class="f"><span>Técnico</span><select id="eTec">${DB.tecnicos.map(t=>`<option value="${t.id}" ${r.tecnicoId===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</select></label>
@@ -5128,9 +5141,47 @@ function modalEditarRegistro(id){
         <td>${esc(nom(DB.tecnicos,x.quien))}<br><span class="tag">${esc(x.motivo||"sin motivo")}</span></td>
         <td class="tag">${esc(x.cambios)}</td></tr>`).join("")}</tbody></table></div>`:""}
   `, d=>{
+    const $ot=d.querySelector("#eOT"), $cp=d.querySelector("#eComp");
+    /* Componente vigente: el que se acaba de elegir, o el que ya tenía. */
+    const compActual=()=>{ const v=$cp.value; return v? byId(DB.componentes,v) : c; };
+    /* Al escribir la OT se llena la lista de componentes de esa orden. */
+    const llenarComps=()=>{
+      const ot=$ot.value.trim();
+      const pares=[];
+      DB.ordenes.filter(x=>String(x.ot)===ot).forEach(x=>
+        DB.componentes.filter(y=>y.ordenId===x.id).forEach(y=>pares.push(y)));
+      const ords=DB.ordenes.filter(x=>String(x.ot)===ot);
+      let vacio;
+      if(!ot) vacio="escribe el número de OT arriba";
+      else if(!ords.length) vacio="esa OT no está cargada en la app";
+      else vacio="esa OT no tiene componentes cargados";
+      $cp.innerHTML = (pares.length
+        ? `<option value="">— elige —</option>`+pares.map(y=>
+            `<option value="${y.id}" ${r.componenteId===y.id?"selected":""}>${esc(nom(DB.tiposComponente,y.tipoComponenteId))} \u00b7 ${esc(nom(DB.tipologias,y.tipologiaId,"—"))} \u00b7 ${y.cantidad} und \u00b7 ${esc(nom(DB.cuartos,y.cuartoId))}</option>`).join("")
+        : `<option value="">${vacio}</option>`)
+        + (ords.length?`<option value="__nuevo__">+ Agregar componente a esta OT\u2026</option>`:"");
+    };
+    /* Si el componente que trabajó el técnico no está en la orden, se crea aquí
+       mismo sin perder lo que ya se escribió en el corrector. */
+    $cp.onchange=()=>{
+      if($cp.value!=="__nuevo__") return;
+      $cp.value="";
+      const ot=$ot.value.trim();
+      const ord=DB.ordenes.find(x=>String(x.ot)===ot);
+      if(!ord){ toast("Escribe primero una OT que exista"); return; }
+      modalComponenteEn(ord.id, id);
+    };
+    $ot.oninput=llenarComps; llenarComps();
+    if(PRESEL_COMP){                       /* volvemos de crear un componente */
+      const nc=byId(DB.componentes,PRESEL_COMP), no=nc?byId(DB.ordenes,nc.ordenId):null;
+      if(no){ $ot.value=no.ot; llenarComps(); $cp.value=PRESEL_COMP; }
+      PRESEL_COMP=null;
+    }
     d.querySelector("#eRecalc").onclick=()=>{
       const a=d.querySelector("#eAct").value, cant=+d.querySelector("#eCant").value||0;
-      d.querySelector("#eStd").value = stdRegistro(c, a, cant);
+      const cc=compActual();
+      if(!cc){ toast("Primero asigna la OT y el componente"); return; }
+      d.querySelector("#eStd").value = stdRegistro(cc, a, cant);
       toast("Estándar recalculado");
     };
     const an=d.querySelector("#eAnular"); if(an) an.onclick=()=>{ cerrarModal(); anularRegistro(id); };
@@ -5149,10 +5200,29 @@ function modalEditarRegistro(id){
         const val=v=>k==="tecnicoId"?nom(DB.tecnicos,v):k==="actividadId"?nom(DB.actividades,v):(v||"vacío");
         cambios.push(`${et}: ${val(r[k])} → ${val(nuevo[k])}`);
       }});
+      /* Reasignación de orden y componente */
+      const nuevoComp = $cp.value ? byId(DB.componentes,$cp.value) : null;
+      const sinOrden = d.querySelector("#eSinOrden").checked;
+      let reasigna=null;
+      if(sinOrden && !r.sinOrden){
+        reasigna={sinOrden:true, ordenId:null, componenteId:null};
+        cambios.push("marcado como trabajo sin orden");
+      } else if(nuevoComp && nuevoComp.id!==r.componenteId){
+        const ord=byId(DB.ordenes,nuevoComp.ordenId);
+        reasigna={sinOrden:false, ordenId:nuevoComp.ordenId, componenteId:nuevoComp.id,
+          tipoComponenteId:nuevoComp.tipoComponenteId, tipologiaId:nuevoComp.tipologiaId||null,
+          cuartoId:nuevoComp.cuartoId, otTexto:ord?ord.ot:(r.otTexto||""),
+          compTexto:nom(DB.tiposComponente,nuevoComp.tipoComponenteId,"")};
+        cambios.push(`orden: ${r.otTexto||"sin OT"} → ${reasigna.otTexto} · ${reasigna.compTexto}`);
+        /* si el usuario no tocó el estándar a mano, se recalcula con el componente nuevo */
+        if(nuevo.minutosStd===r.minutosStd)
+          nuevo.minutosStd = stdRegistro(nuevoComp, nuevo.actividadId, nuevo.cantidad);
+      }
       if(!cambios.length){ toast("No cambiaste nada"); return; }
       commit(()=>{
         const t=byId(DB.registros,id); if(!t) return;
         Object.assign(t,nuevo);
+        if(reasigna) Object.assign(t,reasigna);
         t.historial=(t.historial||[]).concat([{cuando:new Date().toISOString(), quien:YO, motivo, cambios:cambios.join(" · ")}]);
         t.editadoPor=YO; t.editadoEn=new Date().toISOString();
       },"Corrección guardada");
@@ -5253,7 +5323,17 @@ function modalOrden(id, otPrecargada){
       commit(()=>{ DB.componentes=DB.componentes.filter(y=>y.id!==c.id); },"Componente eliminado"); cerrarModal(); });
   });
 }
-function modalComponente(ordenId){
+/* Agregar un componente desde el corrector de registros.
+   Al terminar se vuelve a abrir el corrector (con los handlers vivos) y el
+   componente recién creado queda seleccionado. */
+function modalComponenteEn(ordenId, registroId){
+  modalComponente(ordenId, nuevoId=>{
+    PRESEL_COMP = nuevoId;
+    modalEditarRegistro(registroId);
+  });
+}
+let PRESEL_COMP = null;
+function modalComponente(ordenId, alCrear){
   abrirModal("Agregar componente", `
     <label class="f"><span>Cuarto</span><select id="cFiltro">
       <option value="">Todos los cuartos</option>
@@ -5282,11 +5362,16 @@ function modalComponente(ordenId){
       sCu.value=t.cuartoId;
     };
     sFil.onchange=pintarTipos; sTipo.onchange=pintarTip; pintarTipos();
-    d.querySelector("#cGuardar").onclick=()=>{
+    d.querySelector("#cGuardar").onclick=async()=>{
       if(!sTipo.value){ toast("Elige un tipo de componente"); return; }
       const nuevo={id:uid("cp"),ordenId,tipoComponenteId:sTipo.value,tipologiaId:sTip.value||null,cantidad:+d.querySelector("#cCant").value||1,cuartoId:sCu.value,estado:"Ingresada",serie:"",origen:"manual"};
-      commit(()=>{ DB.componentes.push(nuevo); const o=byId(DB.ordenes,ordenId); if(o) o.revisar=null; },"Componente agregado");
-      R.componenteId=nuevo.id; cerrarModal();
+      cerrarModal();
+      /* Hay que ESPERAR a que el componente quede guardado: commit vuelve a
+         leer la base antes de aplicar, y si no se espera, quien recibe el id
+         todavía no lo encuentra. */
+      await commit(()=>{ DB.componentes.push(nuevo); const o=byId(DB.ordenes,ordenId); if(o) o.revisar=null; },"Componente agregado");
+      if(alCrear) alCrear(nuevo.id);
+      else { R.componenteId=nuevo.id; render(); }
     };
   });
 }

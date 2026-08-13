@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-13 · v24";
+const VERSION_APP = "2026-08-13 · v25";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -547,6 +547,34 @@ function capacidadDia(iso){
    Regla clave: si el técnico registra trabajo un día, ese día cuenta completo
    aunque la ausencia siga abierta. Así el rango se cierra solo cuando vuelve.
    ========================================================================= */
+/* =========================================================================
+   IDENTIFICADORES ESTABLES
+   Antes cada equipo le ponía a la orden un número al azar. La OT 4853 era
+   or_msnlhph... en el PC del coordinador y or_msqbg24... en el de Felipe:
+   la misma orden con dos nombres. Al llegar el registro de Felipe, aquí no
+   existía ese número y quedaba "sin OT".
+   Ahora el identificador se CALCULA a partir del contenido (OT + cuarto +
+   fecha de ingreso), así que todos los equipos llegan al mismo resultado.
+   Es la misma idea de la cédula: se deriva de la persona, no de quién archiva.
+   ========================================================================= */
+function hash36(txt){
+  let a=2166136261, b=2654435761;
+  const s=String(txt);
+  for(let i=0;i<s.length;i++){
+    const c=s.charCodeAt(i);
+    a^=c; a=Math.imul(a,16777619);
+    b=Math.imul(b^c, 2246822519); b=(b<<13)|(b>>>19);
+  }
+  return ((a>>>0).toString(36)+(b>>>0).toString(36)).padEnd(13,"0").slice(0,13);
+}
+const claveOrden = (ot,cuartoDeclaradoId,fechaIngreso)=>
+  [String(ot==null?"":ot).trim().toLowerCase(), cuartoDeclaradoId||"", fechaIngreso||""].join("|");
+function idOrden(ot, cuartoDeclaradoId, fechaIngreso){
+  return "or_"+hash36(claveOrden(ot,cuartoDeclaradoId,fechaIngreso));
+}
+function idComponente(ordenId, tipoComponenteId, tipologiaId){
+  return "cp_"+hash36([ordenId, tipoComponenteId||"", tipologiaId||""].join("|"));
+}
 function ausenciaEn(tecnicoId, iso){
   return (DB.ausencias||[]).find(a=>a.tecnicoId===tecnicoId
     && iso>=a.desde && (!a.hasta || iso<=a.hasta));
@@ -1136,6 +1164,43 @@ function migrar(){
      "Balanceo " y "Balanceo" se veían como dos actividades distintas en los
      informes. Se recortan una sola vez. ---------------------------------- */
   if(!Array.isArray(DB.ausencias)){ DB.ausencias=[]; n++; }
+  /* --- v25: renumerar órdenes y componentes con identificadores estables ---
+     Se recalcula el id de cada orden y componente a partir de su contenido y
+     se arrastran las referencias de registros y componentes. A partir de aquí
+     todos los equipos coinciden y los registros dejan de quedar "sin OT". */
+  if(!DB.meta.idsEstables){
+    const mapaO={}, mapaC={}, usadosO=new Set(), usadosC=new Set();
+    DB.ordenes.forEach(o=>{
+      let nid=idOrden(o.ot,o.cuartoDeclaradoId||"",o.fechaIngreso||"");
+      while(usadosO.has(nid)) nid=nid+"x";          /* choque: se desempata */
+      usadosO.add(nid); if(nid!==o.id){ mapaO[o.id]=nid; o.id=nid; n++; }
+    });
+    DB.componentes.forEach(c=>{
+      if(mapaO[c.ordenId]) c.ordenId=mapaO[c.ordenId];
+      let nid=idComponente(c.ordenId,c.tipoComponenteId,c.tipologiaId||null);
+      while(usadosC.has(nid)) nid=nid+"x";
+      usadosC.add(nid); if(nid!==c.id){ mapaC[c.id]=nid; c.id=nid; n++; }
+    });
+    /* Cada equipo arregla SUS registros: los que nacieron aquí conocen la orden
+       y quedan apuntando al identificador estable. Se marca la hora para que,
+       al sincronizar, esta versión corregida le gane a la rota que tengan los
+       demás equipos. Así el arreglo viaja solo y nadie corrige a mano. */
+    const ahora=new Date().toISOString();
+    DB.registros.forEach(r=>{
+      let toco=false;
+      if(r.ordenId && mapaO[r.ordenId]){ r.ordenId=mapaO[r.ordenId]; toco=true; }
+      if(r.componenteId && mapaC[r.componenteId]){ r.componenteId=mapaC[r.componenteId]; toco=true; }
+      if(toco){
+        const c=byId(DB.componentes,r.componenteId), o=byId(DB.ordenes,r.ordenId);
+        if(c && !r.tipoComponenteId){ r.tipoComponenteId=c.tipoComponenteId; r.tipologiaId=c.tipologiaId||null;
+          r.compTexto=r.compTexto||nom(DB.tiposComponente,c.tipoComponenteId,""); }
+        if(o && !r.otTexto) r.otTexto=o.ot;
+        r.actualizado=ahora;                /* para que gane en la sincronización */
+        n++;
+      }
+    });
+    DB.meta.idsEstables=true; n++;
+  }
   ["cuartos","tecnicos","tiposComponente","tipologias","actividades","clientes"].forEach(k=>{
     (DB[k]||[]).forEach(x=>{ if(typeof x.nombre==="string" && x.nombre!==x.nombre.trim()){ x.nombre=x.nombre.trim(); n++; } });
   });
@@ -4514,7 +4579,8 @@ function aplicarFilas(filas, mapa){
       if(o){ o.ot=ot; o.cuartoDeclaradoId=cuId||o.cuartoDeclaradoId||""; o.fechaIngreso=fGrupo||o.fechaIngreso; adoptadas++; }
     }
     const primera=filasOT[0];
-    if(!o){ o={id:uid("or"),ot,cuartoDeclaradoId:cuId||"",cliente:"",fechaIngreso:fGrupo||hoyISO(),estado:"Ingresada",obs:""};
+    if(!o){ const fIng=fGrupo||hoyISO();
+      o={id:idOrden(ot,cuId||"",fIng),ot,cuartoDeclaradoId:cuId||"",cliente:"",fechaIngreso:fIng,estado:"Ingresada",obs:""};
       DB.ordenes.push(o); nOT++; }
     else { o.cuartoDeclaradoId=cuId||o.cuartoDeclaradoId||""; nAct++; }
     usadas.add(o.id);
@@ -4579,7 +4645,7 @@ function aplicarFilas(filas, mapa){
         acum[tipo.id]=(acum[tipo.id]||0)+cant;
         let comp = DB.componentes.find(c=>c.ordenId===o.id && c.tipoComponenteId===tipo.id);
         if(comp){ comp.cantidad=acum[tipo.id]; if(r.tip && !comp.tipologiaId) comp.tipologiaId=r.tip.id; comp.cuartoId=tipo.cuartoId; }
-        else { comp={id:uid("cp"),ordenId:o.id,tipoComponenteId:tipo.id,tipologiaId:r.tip?r.tip.id:null,
+        else { comp={id:idComponente(o.id,tipo.id,r.tip?r.tip.id:null),ordenId:o.id,tipoComponenteId:tipo.id,tipologiaId:r.tip?r.tip.id:null,
           cantidad:acum[tipo.id], cuartoId:tipo.cuartoId, estado:o.estado, serie:"", origen:"hoja"}; DB.componentes.push(comp); nC++; }
         comp.origen = comp.origen || "hoja";
         creados.push(comp);
@@ -5422,7 +5488,9 @@ function modalOrden(id, otPrecargada){
       const datos={ot, cliente:d.querySelector("#mCli").value.trim(), fechaIngreso:d.querySelector("#mFec").value, estado:d.querySelector("#mEst").value, obs:d.querySelector("#mObs").value};
       let creada=null;
       commit(()=>{ if(o){ Object.assign(byId(DB.ordenes,o.id),datos); }
-        else { creada={id:uid("or"),...datos}; DB.ordenes.push(creada); R.ordenId=creada.id; } }, "Orden guardada");
+        else { creada={id:idOrden(datos.ot,datos.cuartoDeclaradoId||"",datos.fechaIngreso||hoyISO()),...datos};
+          if(byId(DB.ordenes,creada.id)) creada.id=uid("or");     /* choque improbable */
+          DB.ordenes.push(creada); R.ordenId=creada.id; } }, "Orden guardada");
       cerrarModal();
       if(creada && VISTA==="registro"){ R.paso=2; R.componenteId=null; R.sel={}; R.busca="";
         setTimeout(()=>modalComponente(creada.id), 120); }
@@ -5479,7 +5547,9 @@ function modalComponente(ordenId, alCrear){
     sFil.onchange=pintarTipos; sTipo.onchange=pintarTip; pintarTipos();
     d.querySelector("#cGuardar").onclick=async()=>{
       if(!sTipo.value){ toast("Elige un tipo de componente"); return; }
-      const nuevo={id:uid("cp"),ordenId,tipoComponenteId:sTipo.value,tipologiaId:sTip.value||null,cantidad:+d.querySelector("#cCant").value||1,cuartoId:sCu.value,estado:"Ingresada",serie:"",origen:"manual"};
+      let idc=idComponente(ordenId,sTipo.value,sTip.value||null);
+      if(byId(DB.componentes,idc)) idc=uid("cp");                 /* ya existe uno igual */
+      const nuevo={id:idc,ordenId,tipoComponenteId:sTipo.value,tipologiaId:sTip.value||null,cantidad:+d.querySelector("#cCant").value||1,cuartoId:sCu.value,estado:"Ingresada",serie:"",origen:"manual"};
       cerrarModal();
       /* Hay que ESPERAR a que el componente quede guardado: commit vuelve a
          leer la base antes de aplicar, y si no se espera, quien recibe el id

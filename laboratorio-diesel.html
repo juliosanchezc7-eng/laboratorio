@@ -539,6 +539,48 @@ function capacidadDia(iso){
   if(!bruto) return 0;
   return Math.max(0, bruto - (h.descontarBreak ? h.breakMin : 0));
 }
+/* =========================================================================
+   AUSENCIAS Y JORNADA
+   La jornada disponible no es igual para todos: uno puede estar incapacitado,
+   otro llegar a mediodía. Aquí se guarda por rango de fechas, y el rango puede
+   quedar ABIERTO cuando todavía no se sabe cuándo vuelve.
+   Regla clave: si el técnico registra trabajo un día, ese día cuenta completo
+   aunque la ausencia siga abierta. Así el rango se cierra solo cuando vuelve.
+   ========================================================================= */
+function ausenciaEn(tecnicoId, iso){
+  return (DB.ausencias||[]).find(a=>a.tecnicoId===tecnicoId
+    && iso>=a.desde && (!a.hasta || iso<=a.hasta));
+}
+function trabajoEse(tecnicoId, iso){
+  return DB.registros.some(r=>!r.anulado && r.tecnicoId===tecnicoId && r.fecha===iso);
+}
+function capacidadTecnicoDia(tecnicoId, iso){
+  const base=capacidadDia(iso);
+  if(!base) return 0;                       /* festivo o día no laboral */
+  const a=ausenciaEn(tecnicoId, iso);
+  if(!a) return base;
+  if(trabajoEse(tecnicoId, iso)) return base;   /* volvió: la ausencia no aplica */
+  return a.tipo==="media" ? Math.round(base/2) : 0;
+}
+function capacidadTecnicoRango(tecnicoId, desde, hasta){
+  let t=0; const a=new Date(desde+"T12:00:00"), b=new Date(hasta+"T12:00:00");
+  while(a<=b){ t+=capacidadTecnicoDia(tecnicoId, isoLocal(a)); a.setDate(a.getDate()+1); }
+  return t;
+}
+/* Suma de la jornada realmente disponible de todo el equipo en un rango. */
+function capacidadEquipoRango(desde, hasta){
+  return DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador")
+    .reduce((acc,t)=>acc+capacidadTecnicoRango(t.id, desde, hasta), 0);
+}
+/* Minutos que se perdieron por ausencia en el rango (para el informe). */
+function minutosAusencia(desde, hasta){
+  return DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador")
+    .reduce((acc,t)=>{
+      let p=0; const a=new Date(desde+"T12:00:00"), b=new Date(hasta+"T12:00:00");
+      while(a<=b){ const iso=isoLocal(a); p+=capacidadDia(iso)-capacidadTecnicoDia(t.id,iso); a.setDate(a.getDate()+1); }
+      return acc+p;
+    },0);
+}
 function capacidadRango(desde, hasta){
   let t=0; const a=new Date(desde+"T12:00:00"), b=new Date(hasta+"T12:00:00");
   while(a<=b){ t+=capacidadDia(isoLocal(a)); a.setDate(a.getDate()+1); }
@@ -1093,6 +1135,7 @@ function migrar(){
   /* --- v23: nombres de maestros sin espacios sobrantes ----------------------
      "Balanceo " y "Balanceo" se veían como dos actividades distintas en los
      informes. Se recortan una sola vez. ---------------------------------- */
+  if(!Array.isArray(DB.ausencias)){ DB.ausencias=[]; n++; }
   ["cuartos","tecnicos","tiposComponente","tipologias","actividades","clientes"].forEach(k=>{
     (DB[k]||[]).forEach(x=>{ if(typeof x.nombre==="string" && x.nombre!==x.nombre.trim()){ x.nombre=x.nombre.trim(); n++; } });
   });
@@ -1133,7 +1176,7 @@ async function commit(fn, msg){
 }
 
 /* ---- maestros: se guardan sin redibujar (si no, el botón se va antes del clic) ---- */
-const MAESTROS=["cuartos","tecnicos","tiposComponente","tipologias","actividades","estandares","repartos","clientes","estados","estadosCerrados","motivos","festivos","tiposNovedad"];
+const MAESTROS=["cuartos","tecnicos","tiposComponente","tipologias","actividades","estandares","repartos","clientes","estados","estadosCerrados","motivos","festivos","tiposNovedad","ausencias"];
 function paqueteMaestros(){
   const p={ts:DB.meta.configTs||0, horario:DB.meta.horario, pin:DB.meta.pin||""};
   MAESTROS.forEach(k=>p[k]=DB[k]); return p;
@@ -1792,6 +1835,62 @@ function regsFiltrados(){
     && (!FD.cuarto || r.cuartoId===FD.cuarto)
     && (!FD.tecnico || r.tecnicoId===FD.tecnico));
 }
+/* Panel para marcar quién no vino y por cuánto tiempo. */
+function panelAusencias(d,h){
+  const activos=DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador");
+  const enRango=(DB.ausencias||[]).filter(a=>a.desde<=h && (!a.hasta || a.hasta>=d))
+    .sort((a,b)=>(a.hasta?1:0)-(b.hasta?1:0) || b.desde.localeCompare(a.desde));
+  const perdidas=minutosAusencia(d,h);
+  const capIdeal=capacidadRango(d,h)*activos.length;
+  return `<div class="card noprint"><header><h2>Ausencias y jornada</h2>
+    <span class="sub mono">${hrs(perdidas)} h de ${hrs(capIdeal)} h</span>
+    <div class="push"><button class="btn sm primary" id="ausAdd">+ Registrar ausencia</button></div></header>
+  <div class="body">
+    <p class="hint" style="margin-top:0">Quien no vino no debe cargar con jornada que no tuvo. Deja el <b>hasta</b> vacío si aún no sabes cuándo vuelve: el día que registre trabajo, ese día vuelve a contarle completo.</p>
+    ${enRango.length? `<div class="tw"><table><thead><tr><th>Técnico</th><th>Motivo</th><th>Desde</th><th>Hasta</th><th class="num">Jornada perdida</th><th></th></tr></thead><tbody>
+    ${enRango.map(a=>{
+      const t=byId(DB.tecnicos,a.tecnicoId);
+      let p=0; const x=new Date(d+"T12:00:00"), y=new Date(h+"T12:00:00");
+      while(x<=y){ const iso=isoLocal(x); if(iso>=a.desde && (!a.hasta||iso<=a.hasta)) p+=capacidadDia(iso)-capacidadTecnicoDia(a.tecnicoId,iso); x.setDate(x.getDate()+1); }
+      return `<tr>
+        <td><b>${esc(t?t.nombre:"—")}</b><br><span class="tag">${esc(nom(DB.cuartos,t?t.cuartoId:""))}</span></td>
+        <td>${esc(a.motivo||a.tipo)}${a.tipo==="media"?' <span class="chip c-azul">media jornada</span>':""}</td>
+        <td class="mono">${fmtFecha(a.desde)}</td>
+        <td class="mono">${a.hasta?fmtFecha(a.hasta):'<span class="chip c-naranja">abierta</span>'}</td>
+        <td class="num mono">${hrs(p)} h</td>
+        <td style="width:150px">${a.hasta?"":`<button class="btn sm" data-auscerrar="${a.id}">Ya volvió</button>`}
+          <button class="btn sm danger" data-ausdel="${a.id}">×</button></td></tr>`;}).join("")}
+    </tbody></table></div>`
+    : `<div class="empty">Nadie marcado como ausente en este periodo.</div>`}
+  </div></div>`;
+}
+function modalAusencia(){
+  const activos=DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador");
+  abrirModal("Registrar ausencia", `
+    <label class="f"><span>Técnico</span><select id="auTec" style="font-size:15px;padding:10px">
+      ${activos.map(t=>`<option value="${t.id}">${esc(t.nombre)} \u00b7 ${esc(nom(DB.cuartos,t.cuartoId))}</option>`).join("")}</select></label>
+    <label class="f"><span>Motivo</span><select id="auMot" style="font-size:15px;padding:10px">
+      ${["Incapacidad","Calamidad doméstica","Permiso","Vacaciones","Cita médica","Llegó tarde / salió temprano","Otro"].map(x=>`<option>${x}</option>`).join("")}</select></label>
+    <label class="f"><span>Jornada</span><select id="auTipo" style="font-size:15px;padding:10px">
+      <option value="ausente">No vino \u00b7 día completo</option>
+      <option value="media">Media jornada</option></select></label>
+    <div class="row">
+      <label class="f"><span>Desde</span><input type="date" id="auD" value="${hoyISO()}"></label>
+      <label class="f"><span>Hasta (opcional)</span><input type="date" id="auH"></label>
+    </div>
+    <p class="hint" style="margin-top:-4px">Si no sabes cuándo vuelve, deja <b>Hasta</b> vacío.</p>
+    <button class="btn primary" id="auOk">Guardar</button>`,
+    dd=>{ dd.querySelector("#auOk").onclick=()=>{
+      const tec=dd.querySelector("#auTec").value, desde=dd.querySelector("#auD").value;
+      const hasta=dd.querySelector("#auH").value||null;
+      if(!tec||!desde){ toast("Falta el técnico o la fecha"); return; }
+      if(hasta && hasta<desde){ toast("La fecha final es anterior a la inicial"); return; }
+      cerrarModal();
+      commit(()=>{ DB.ausencias=(DB.ausencias||[]).concat([{id:uid("au"), tecnicoId:tec,
+        desde, hasta, tipo:dd.querySelector("#auTipo").value, motivo:dd.querySelector("#auMot").value,
+        creadoPor:YO, creado:new Date().toISOString()}]); },"Ausencia registrada");
+    };});
+}
 function vDashboard(){
   const [d,h]=rangoActivo();
   const rs=regsFiltrados();
@@ -1800,7 +1899,8 @@ function vDashboard(){
   const efi = real? Math.round(std/real*100):0;
   const nTec = DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador").length;
   const minNoProd = minutosNoProductivos(rs);
-  const capTotal = Math.max(0, capacidadRango(d,h)*nTec - minNoProd);
+  const minAus = minutosAusencia(d,h);
+  const capTotal = Math.max(0, capacidadEquipoRango(d,h) - minNoProd);
   const prod = capTotal? Math.round(std/capTotal*100):0;
   const undTerm = rs.filter(r=>r.actividadId==="ac_prueba_fin"||r.actividadId==="ac_empaque").reduce((a,r)=>a+r.cantidad,0);
   const otsTocadas = new Set(rs.map(r=>r.ordenId)).size;
@@ -1928,7 +2028,7 @@ function filtrosDash(){
     <button class="btn sm" data-rng="pasada">Semana pasada</button>
     <button class="btn sm" data-rng="mes">Este mes</button>
     <button class="btn sm" data-rng="hoy">Hoy</button></div>
-  </div></div></div>`;
+  </div></div></div>`+panelAusencias(d,h);
 }
 function diasHabiles(d,h){
   let n=0; const a=new Date(d+"T12:00:00"), b=new Date(h+"T12:00:00");
@@ -1936,6 +2036,18 @@ function diasHabiles(d,h){
   return Math.max(1,n);
 }
 function pDashboard(){
+  const aa=$("#ausAdd"); if(aa) aa.onclick=()=>modalAusencia();
+  document.querySelectorAll("[data-auscerrar]").forEach(b=>b.onclick=()=>{
+    const id=b.dataset.auscerrar;
+    /* "Ya volvió": la ausencia se cierra el día anterior al de hoy. */
+    const ayer=restarDias(hoyISO(),1);
+    commit(()=>{ const a=(DB.ausencias||[]).find(x=>x.id===id); if(a) a.hasta=(ayer<a.desde?a.desde:ayer); },"Ausencia cerrada");
+  });
+  document.querySelectorAll("[data-ausdel]").forEach(b=>b.onclick=async()=>{
+    const id=b.dataset.ausdel;
+    if(!await confirmar("Borrar ausencia","La jornada de esos días vuelve a contar completa.","Borrar")) return;
+    commit(()=>{ DB.ausencias=(DB.ausencias||[]).filter(x=>x.id!==id); },"Ausencia borrada");
+  });
   $("#dd").onchange=e=>{FD.desde=e.target.value;render();};
   $("#dh").onchange=e=>{FD.hasta=e.target.value;render();};
   $("#dc").onchange=e=>{FD.cuarto=e.target.value;render();};
@@ -2290,7 +2402,7 @@ function vSemanal(){
   const capDia=capacidadRango(d,h);
   const activos=DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador");
   const minNoProd=minutosNoProductivos(rs);
-  const cap=Math.max(0, capDia*activos.length - minNoProd);
+  const cap=Math.max(0, capacidadEquipoRango(d,h) - minNoProd);
   const ocup=cap?Math.round(real/cap*100):0;
 
   const tec=activos.map(t=>{
@@ -2298,8 +2410,11 @@ function vSemanal(){
     const m=rr.reduce((a,x)=>a+x.minutos,0), s=rr.reduce((a,x)=>a+x.minutosStd,0);
     const u=rr.filter(r=>r.actividadId==="ac_prueba_fin"||r.actividadId==="ac_empaque").reduce((a,x)=>a+x.cantidad,0);
     const np=minutosNoProductivos(rr);
-    const capT=Math.max(1, capDia-np);
-    return {t,m,s,u,np,ef:m?Math.round(s/m*100):0,oc:Math.round(m/capDia*100),pr:Math.round(s/capT*100)};
+    const capReal=capacidadTecnicoRango(t.id,d,h);        /* su jornada, no la del grupo */
+    const capT=Math.max(1, capReal-np);
+    const aus=capDia-capReal;                              /* lo que perdió por ausencia */
+    return {t,m,s,u,np,aus,capReal,ef:m?Math.round(s/m*100):0,
+      oc:capReal?Math.round(m/capReal*100):0, pr:Math.round(s/capT*100)};
   }).sort((a,b)=>b.m-a.m);
 
   const entregadas=DB.ordenes.filter(o=>/entregad/i.test(o.estado||"")).length;

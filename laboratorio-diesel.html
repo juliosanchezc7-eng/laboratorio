@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-11 · v22";
+const VERSION_APP = "2026-08-13 · v24";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -244,8 +244,12 @@ const Store = {
 };
 
 const uid = p => (p||"id") + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-const hoyISO = () => { const d=new Date(); return new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10); };
-const restarDias = (iso,d) => { const x=new Date(iso+"T12:00:00"); x.setDate(x.getDate()-(+d||0)); return x.toISOString().slice(0,10); };
+/* Fecha en formato AAAA-MM-DD usando SIEMPRE el calendario local.
+   Antes se usaba toISOString(), que convierte a UTC: en Colombia (UTC-5)
+   después de las 7 pm el día saltaba al siguiente. */
+const isoLocal = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+const hoyISO = () => isoLocal(new Date());
+const restarDias = (iso,d) => { const x=new Date(iso+"T12:00:00"); x.setDate(x.getDate()-(+d||0)); return isoLocal(x); };
 
 /* ---------- Semillas: TODO es editable desde la pestaña Maestros ---------- */
 function semilla(){
@@ -385,10 +389,10 @@ function semanaDe(iso){
   const d=new Date(iso+"T12:00:00");
   const diff=(d.getDay()-inicioSemana()+7)%7;
   d.setDate(d.getDate()-diff);
-  return d.toISOString().slice(0,10);
+  return isoLocal(d);
 }
 const DIAS_SEM=["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];
-function rangoSemana(lunesISO){ const a=new Date(lunesISO+"T12:00:00"); const b=new Date(a); b.setDate(b.getDate()+6); return [lunesISO, b.toISOString().slice(0,10)]; }
+function rangoSemana(lunesISO){ const a=new Date(lunesISO+"T12:00:00"); const b=new Date(a); b.setDate(b.getDate()+6); return [lunesISO, isoLocal(b)]; }
 function fmtFecha(iso){ if(!iso) return "—"; const [y,m,d]=iso.split("-"); return `${d}/${m}/${y}`; }
 function chipEstado(e){
   const m={"Almacén":"c-gris","Diagnóstico":"c-azul","Pendiente autorización":"c-ambar",
@@ -430,15 +434,93 @@ function sumaReparto(tc){
   return lista.reduce((a,r)=>a+(+r.porcentaje||0),0);
 }
 function estandarMin(tipoComponenteId, tipologiaId, actividadId){
-  const exacto = estandarExacto(tipoComponenteId, tipologiaId, actividadId);
-  if(exacto!=null) return exacto;
+  /* 1) Minutos escritos para ESA tipología exacta: mandan sobre todo. */
+  if(tipologiaId && tipologiaId!=="*"){
+    const propio = DB.estandares.find(e=>e.tipoComponenteId===tipoComponenteId
+      && e.actividadId===actividadId && e.tipologiaId===tipologiaId);
+    if(propio) return +propio.minutos||0;
+  }
+  /* 2) Minutos generales de la actividad. Si la tipología tiene su propio
+        total (un biturbo son 5 h y no 3), cada paso se escala en proporción. */
+  const gen = DB.estandares.find(e=>e.tipoComponenteId===tipoComponenteId
+    && e.actividadId===actividadId && e.tipologiaId==="*");
+  if(gen){
+    const m=+gen.minutos||0;
+    if(gen.aparte) return m;                       /* alternativa suelta: no escala */
+    const f=factorTipologia(tipoComponenteId, tipologiaId);
+    return f===1 ? m : Math.round(m*f);
+  }
+  /* 3) Plan B: total del proceso × porcentaje del reparto escrito a mano. */
   const total = totalProceso(tipoComponenteId, tipologiaId);
   if(!total) return 0;
   const pct = repartoDe(tipoComponenteId, actividadId);
   return pct ? Math.round(total*pct/100) : 0;
 }
+/* -------------------------------------------------------------------------
+   PESO DE UNA ACTIVIDAD DENTRO DEL PROCESO
+   Si el componente tiene minutos escritos por actividad, el porcentaje se
+   DEDUCE de ellos: lavado 15 min de 90 = 17% del proceso. Nadie tiene que
+   escribir porcentajes. El reparto manual queda solo como plan B para
+   componentes de los que únicamente se conoce el total.
+------------------------------------------------------------------------- */
+function minutosPropios(tc){
+  return DB.estandares.filter(e=>e.tipoComponenteId===tc && e.tipologiaId==="*"
+    && e.actividadId!==ACT_TOTAL && (+e.minutos||0)>0);
+}
+/* Hay actividades que NO forman parte del proceso normal: son alternativas o
+   servicios sueltos (montaje de cartridge en vez de armar, mantenimiento sin
+   reparación). No suman al total ni entran en los porcentajes, pero el técnico
+   sí puede marcarlas y ganan sus minutos. */
+function minutosDelProceso(tc){ return minutosPropios(tc).filter(e=>!e.aparte); }
+/* Cuánto tarda de más (o de menos) una tipología frente al proceso normal.
+   Biturbo 335 min sobre un turbo de 215 -> factor 1,56: cada paso se estira. */
+function factorTipologia(tc, tipologiaId){
+  if(!tipologiaId || tipologiaId==="*") return 1;
+  const tt=DB.estandares.find(e=>e.tipoComponenteId===tc && e.actividadId===ACT_TOTAL && e.tipologiaId===tipologiaId);
+  if(!tt) return 1;
+  const base=resumenTiempos(tc).total;
+  if(!base) return 1;
+  return (+tt.minutos||0)/base;
+}
+function pesoActividad(tc, actId){
+  const props = minutosDelProceso(tc);
+  if(props.length){
+    const suma = props.reduce((a,e)=>a+(+e.minutos||0),0);
+    const mia  = props.find(e=>e.actividadId===actId);
+    return (mia && suma) ? (+mia.minutos/suma*100) : 0;
+  }
+  return repartoDe(tc, actId);         /* plan B: el reparto escrito a mano */
+}
+/* Actividades que de verdad se le hacen a un componente: las que tienen
+   minutos escritos. Si todavía no hay ninguna configurada, se muestran todas
+   las del cuarto para no dejar al técnico sin dónde registrar. */
+function actividadesDeComponente(tipoComponenteId, cuartoId){
+  const todas = actividadesDe(cuartoId);
+  const props = minutosPropios(tipoComponenteId);
+  if(!props.length) return todas;
+  const con = new Set(props.map(e=>e.actividadId));
+  return todas.filter(a=>con.has(a.id) || a.noProductiva);
+}
+/* Suma por fase, para el resumen en vivo del editor. */
+function resumenTiempos(tc){
+  const r={diagnostico:0, reparacion:0, entrega:0, apoyo:0, total:0};
+  minutosDelProceso(tc).forEach(e=>{
+    const a=byId(DB.actividades,e.actividadId); if(!a || a.noProductiva) return;
+    const m=+e.minutos||0;
+    const f=(a.fase||"").toLowerCase();
+    if(f.indexOf("diagn")===0) r.diagnostico+=m;
+    else if(f.indexOf("entrega")===0) r.entrega+=m;
+    else if(f.indexOf("apoyo")===0) r.apoyo+=m;
+    else r.reparacion+=m;                      /* Lavado y Reparación cuentan como reparación */
+  });
+  r.total=r.diagnostico+r.reparacion+r.entrega;
+  return r;
+}
 /* De dónde salió el número, para mostrarlo al técnico y al coordinador. */
 function origenEstandar(tipoComponenteId, tipologiaId, actividadId){
+  const gen=DB.estandares.find(e=>e.tipoComponenteId===tipoComponenteId
+    && e.actividadId===actividadId && e.tipologiaId==="*");
+  if(gen && !gen.aparte && factorTipologia(tipoComponenteId,tipologiaId)!==1) return "escala";
   if(estandarExacto(tipoComponenteId, tipologiaId, actividadId)!=null) return "propio";
   const total=totalProceso(tipoComponenteId, tipologiaId);
   if(total && repartoDe(tipoComponenteId, actividadId)) return "reparto";
@@ -459,7 +541,7 @@ function capacidadDia(iso){
 }
 function capacidadRango(desde, hasta){
   let t=0; const a=new Date(desde+"T12:00:00"), b=new Date(hasta+"T12:00:00");
-  while(a<=b){ t+=capacidadDia(a.toISOString().slice(0,10)); a.setDate(a.getDate()+1); }
+  while(a<=b){ t+=capacidadDia(isoLocal(a)); a.setDate(a.getDate()+1); }
   return t;
 }
 /* Tipologías válidas para un tipo de componente.
@@ -519,6 +601,21 @@ function yaRegistrado(componenteId, actividadId, excluirId){
 /* Hay actividades que se hacen UNA VEZ por orden, no por pieza: el informe
    técnico de 6 inyectores es uno solo. No se multiplican por la cantidad. */
 function esPorOrden(actividadId){ const a=byId(DB.actividades,actividadId); return !!(a && a.porOrden); }
+/* El registro guarda una FOTO de lo que se trabajó (tipo, tipología, OT en texto).
+   Si mañana la orden se recrea con otro id interno, el registro sigue sabiendo
+   qué era: conserva sus horas estándar y sigue apareciendo en el informe. */
+function fotoComponente(r){
+  const c = byId(DB.componentes, r.componenteId);
+  if(c) return c;
+  if(r.tipoComponenteId) return {id:null, tipoComponenteId:r.tipoComponenteId,
+    tipologiaId:r.tipologiaId||null, cantidad:r.cantidad, cuartoId:r.cuartoId};
+  return null;
+}
+/* Texto de la OT para mostrar, venga de la orden viva o de la foto. */
+function otDeRegistro(r){
+  const o = byId(DB.ordenes, r.ordenId);
+  return o ? o.ot : (r.otTexto||"");
+}
 function stdRegistro(comp, actividadId, cantidad){
   if(!comp) return 0;
   const u = estandarMin(comp.tipoComponenteId, comp.tipologiaId, actividadId);
@@ -536,7 +633,7 @@ function avanceComponente(c){
   });
   let pct=0;
   Object.keys(porAct).forEach(a=>{
-    const p=repartoDe(c.tipoComponenteId,a);
+    const p=pesoActividad(c.tipoComponenteId,a);
     if(p) pct += p * Math.min(1, c.cantidad? porAct[a]/c.cantidad : 1);
   });
   return Math.min(100, Math.round(pct));
@@ -548,7 +645,7 @@ function avanceOrden(o){
 }
 function pendientesComponente(c){
   const hechas=new Set(RA().filter(r=>r.componenteId===c.id).map(r=>r.actividadId));
-  return actividadesDe(c.cuartoId).filter(a=>repartoDe(c.tipoComponenteId,a.id) && !hechas.has(a.id));
+  return actividadesDeComponente(c.tipoComponenteId, c.cuartoId).filter(a=>pesoActividad(c.tipoComponenteId,a.id) && !hechas.has(a.id));
 }
 function cerrados(){ return new Set(DB.estadosCerrados||["Entregado","Dado de baja"]); }
 function estaCerrada(o){ return cerrados().has(o.estado); }
@@ -735,7 +832,7 @@ function migrar(){
     if(r.sinOrden) return;
     /* Copia legible: sobrevive aunque la orden o el componente desaparezcan. */
     if(!r.otTexto && r.ordenId){ const o=byId(DB.ordenes,r.ordenId); if(o){ r.otTexto=o.ot; n++; } }
-    if(!r.compTexto && r.componenteId){ const c=byId(DB.componentes,r.componenteId);
+    if(!r.compTexto && r.componenteId){ const c=fotoComponente(r);
       if(c){ r.compTexto=nom(DB.tiposComponente,c.tipoComponenteId,""); n++; } }
     if(!r.ordenId) return;
     /* Si la orden se recreó con otro id, se reengancha por el número de OT. */
@@ -977,7 +1074,39 @@ function migrar(){
     }
     n++;
   }
-  DB.meta.version=9;
+  /* --- v23: foto del componente en cada registro ---------------------------
+     Hasta v22 el registro solo guardaba ids. Si la orden se recreaba (import,
+     depuración, sincronización desde otro equipo), el registro quedaba huérfano:
+     sin OT, sin componente y con 0 horas estándar. Aquí se rellena la foto de
+     todos los que todavía tienen su componente vivo. --------------------- */
+  (DB.registros||[]).forEach(r=>{
+    const c = byId(DB.componentes, r.componenteId);
+    if(c){
+      if(!r.tipoComponenteId){ r.tipoComponenteId=c.tipoComponenteId; n++; }
+      if(r.tipologiaId===undefined){ r.tipologiaId=c.tipologiaId||null; n++; }
+      if(!r.compTexto){ r.compTexto=nom(DB.tiposComponente,c.tipoComponenteId,""); n++; }
+    }
+    const o = byId(DB.ordenes, r.ordenId);
+    if(o && !r.otTexto){ r.otTexto=o.ot; n++; }
+    if(!r.cuartoId && c && c.cuartoId){ r.cuartoId=c.cuartoId; n++; }
+  });
+  /* --- v23: nombres de maestros sin espacios sobrantes ----------------------
+     "Balanceo " y "Balanceo" se veían como dos actividades distintas en los
+     informes. Se recortan una sola vez. ---------------------------------- */
+  ["cuartos","tecnicos","tiposComponente","tipologias","actividades","clientes"].forEach(k=>{
+    (DB[k]||[]).forEach(x=>{ if(typeof x.nombre==="string" && x.nombre!==x.nombre.trim()){ x.nombre=x.nombre.trim(); n++; } });
+  });
+  ["estados","estadosCerrados","motivos","tiposNovedad"].forEach(k=>{
+    if(Array.isArray(DB[k])){
+      const antes=DB[k].join("|");
+      DB[k]=[...new Set(DB[k].map(x=>String(x).trim()).filter(Boolean))];
+      if(DB[k].join("|")!==antes) n++;
+    }
+  });
+  /* v24: cada tipo de componente recuerda cuánto dice la empresa que vale su
+     reparación, para poder avisar cuando los minutos no cuadran. */
+  (DB.tiposComponente||[]).forEach(t=>{ if(t.estandarReparacion===undefined){ t.estandarReparacion=0; n++; } });
+  DB.meta.version=11;
   return n;
 }
 async function cargar(){
@@ -1149,7 +1278,7 @@ function pasoOrden(){
 
   const cerradas = DB.ordenes.length - abiertas.length;
   const minFecha = (esCoordinador()||!DB.meta.diasRetro) ? "" :
-    new Date(Date.now()-(DB.meta.diasRetro*86400000)).toISOString().slice(0,10);
+    restarDias(hoyISO(), DB.meta.diasRetro);
 
   return `
   <div class="card">
@@ -1210,7 +1339,7 @@ function pasoActividades(){
   const comps = (!R.todas && me2 && todosComps.some(c=>cuartoDeComponente(c)===me2.cuartoId))
     ? todosComps.filter(c=>cuartoDeComponente(c)===me2.cuartoId) : todosComps;
   const c = R.componenteId ? byId(DB.componentes,R.componenteId) : null;
-  const acts = c ? actividadesDe(c.cuartoId) : [];
+  const acts = c ? actividadesDeComponente(c.tipoComponenteId, c.cuartoId) : [];
   return `
   <div class="card">
     <header><h2>Paso 2 · ¿Qué hiciste?</h2><span class="sub mono">OT ${esc(o?etiquetaOT(o):"")}</span></header>
@@ -1312,7 +1441,7 @@ function hoyDelTecnico(){
       <div class="gauge"><i class="${pct>=90?"ok":pct>=50?"warn":"bad"}" style="width:${pct}%"></i></div>
       ${regs.length?`<div class="tw" style="margin-top:12px"><table><thead><tr><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Real</th><th class="num">Std</th><th></th></tr></thead><tbody>
       ${regs.map(r=>{
-        const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
+        const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r);
         return `<tr><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td>
         <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?`${esc(r.compTexto)}`:`<span class="tag">—</span>`)}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td>
@@ -1399,6 +1528,7 @@ async function guardarRegistro(){
   const nuevos = Object.entries(R.sel).map(([actId,s])=>({
     id:uid("rg"), fecha:R.fecha, tecnicoId:YO, ordenId:R.ordenId, componenteId:R.componenteId,
     cuartoId:c.cuartoId, actividadId:actId, cantidad:+s.cantidad||0, minutos:+s.minutos||0,
+    tipoComponenteId:c.tipoComponenteId, tipologiaId:c.tipologiaId||null,   /* foto: sobrevive a la orden */
     minutosStd: stdRegistro(c, actId, s.cantidad),
     tiempoMedido: !!s.ajustado,
     estadoNuevo:R.estadoOrden||"", tipoNovedad:R.tipoNovedad||"", novedad:R.novedad||"",
@@ -1416,7 +1546,7 @@ async function guardarRegistro(){
       const ord = byId(DB.ordenes,R.ordenId); if(ord) ord.estado=ultEstado;
     }
   }, "Registro guardado ✓");
-  empujarRegistros().catch(()=>{});
+  empujarRegistros().catch(e=>{ DB.meta.subidaError=e.message||"no se pudo subir"; });
   if(otrosComp.length){
     /* La orden tiene más componentes: se queda en ella para seguir registrando. */
     R.componenteId=null; R.sel={}; R.novedad=""; R.tipoNovedad=""; R.estadoOrden=""; R.paso=2;
@@ -1443,7 +1573,7 @@ function vMiSemana(){
   const ocup = cap? Math.round(real/cap*100):0;
   const nombresDia=["Domingo","Lunes","Martes","Miércoles","Jueves","Viernes","Sábado"];
   const dias=[]; const a=new Date(d+"T12:00:00");
-  for(let i=0;i<7;i++){ const iso=a.toISOString().slice(0,10);
+  for(let i=0;i<7;i++){ const iso=isoLocal(a);
     const c=capacidadDia(iso);
     if(c>0) dias.push({iso, dow:new Date(iso+"T12:00:00").getDay(), cap:c, min:rs.filter(r=>r.fecha===iso).reduce((x,r)=>x+r.minutos,0)});
     a.setDate(a.getDate()+1); }
@@ -1478,7 +1608,7 @@ function vMiSemana(){
   <div class="card"><header><h2>Mis registros</h2><span class="sub mono">${rs.length}</span></header><div class="body">
     ${rs.length?`<div class="tw"><table><thead><tr><th>Fecha</th><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Horas</th></tr></thead><tbody>
     ${rs.slice().sort((a,b)=>b.fecha.localeCompare(a.fecha)).map(r=>{
-      const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
+      const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r);
       return `<tr><td class="mono">${fmtFecha(r.fecha)}</td><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td>
       <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):"—"} ${c?esc(nom(DB.tipologias,c.tipologiaId,"")):""}</td>
       <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td></tr>`;
@@ -1486,7 +1616,8 @@ function vMiSemana(){
   </div></div>`;
 }
 function pMiSemana(){
-  const mv=n=>{ const l=new Date((MS.lunes||semanaDe(hoyISO()))+"T12:00:00"); l.setDate(l.getDate()+n); MS.lunes=l.toISOString().slice(0,10); render(); };
+  if(!YO) return;                     /* sin técnico elegido no hay controles que enganchar */
+  const mv=n=>{ const l=new Date((MS.lunes||semanaDe(hoyISO()))+"T12:00:00"); l.setDate(l.getDate()+n); MS.lunes=isoLocal(l); render(); };
   $("#msLunes").onchange=e=>{ MS.lunes=semanaDe(e.target.value); render(); };
   $("#msPrev").onclick=()=>mv(-7);
   $("#msNext").onclick=()=>mv(7);
@@ -1760,7 +1891,7 @@ function vDashboard(){
       <thead><tr><th>Fecha</th><th>Técnico</th><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Real h</th><th class="num">Std h</th><th>Novedad</th><th></th></tr></thead>
       <tbody>${(FD.verAnulados? DB.registros.filter(r=>{const [dd,hh]=rangoActivo(); return r.fecha>=dd&&r.fecha<=hh&&(!FD.cuarto||r.cuartoId===FD.cuarto)&&(!FD.tecnico||r.tecnicoId===FD.tecnico);}) : rs)
         .slice().sort((a,b)=>b.fecha.localeCompare(a.fecha)||String(b.creado).localeCompare(String(a.creado))).map(r=>{
-        const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
+        const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r);
         const editado=(r.historial||[]).length;
         return `<tr style="${r.anulado?"opacity:.5;text-decoration:line-through":""}">
         <td class="mono">${fmtFecha(r.fecha)}</td><td>${esc(nom(DB.tecnicos,r.tecnicoId))}</td>
@@ -1812,7 +1943,7 @@ function pDashboard(){
   document.querySelectorAll("[data-rng]").forEach(b=>b.onclick=()=>{
     const t=b.dataset.rng, hy=hoyISO();
     if(t==="semana"){ const l=semanaDe(hy); FD.desde=l; FD.hasta=rangoSemana(l)[1]; }
-    if(t==="pasada"){ const l=new Date(semanaDe(hy)+"T12:00:00"); l.setDate(l.getDate()-7); const li=l.toISOString().slice(0,10); FD.desde=li; FD.hasta=rangoSemana(li)[1]; }
+    if(t==="pasada"){ const l=new Date(semanaDe(hy)+"T12:00:00"); l.setDate(l.getDate()-7); const li=isoLocal(l); FD.desde=li; FD.hasta=rangoSemana(li)[1]; }
     if(t==="mes"){ FD.desde=hy.slice(0,8)+"01"; FD.hasta=hy; }
     if(t==="hoy"){ FD.desde=hy; FD.hasta=hy; }
     render();
@@ -2126,7 +2257,7 @@ function pIngresos(){
     const t=b.dataset.irng, hy=hoyISO();
     if(t==="semana"){ const l=semanaDe(hy); FI.desde=l; FI.hasta=rangoSemana(l)[1]; }
     if(t==="pasada"){ const l=new Date(semanaDe(hy)+"T12:00:00"); l.setDate(l.getDate()-7);
-      const li=l.toISOString().slice(0,10); FI.desde=li; FI.hasta=rangoSemana(li)[1]; }
+      const li=isoLocal(l); FI.desde=li; FI.hasta=rangoSemana(li)[1]; }
     if(t==="mes"){ FI.desde=hy.slice(0,8)+"01"; FI.hasta=hy; }
     render();
   });
@@ -2221,7 +2352,7 @@ function pSemanal(){
   document.querySelectorAll("[data-rng]").forEach(b=>b.onclick=()=>{
     const hy=hoyISO();
     if(b.dataset.rng==="semana"){ const l=semanaDe(hy); FD.desde=l; FD.hasta=rangoSemana(l)[1]; }
-    else { const l=new Date(semanaDe(hy)+"T12:00:00"); l.setDate(l.getDate()-7); const li=l.toISOString().slice(0,10); FD.desde=li; FD.hasta=rangoSemana(li)[1]; }
+    else { const l=new Date(semanaDe(hy)+"T12:00:00"); l.setDate(l.getDate()-7); const li=isoLocal(l); FD.desde=li; FD.hasta=rangoSemana(li)[1]; }
     render();
   });
   $("#imprimir").onclick=()=>window.print();
@@ -2230,11 +2361,11 @@ function pSemanal(){
 /* =========================================================================
    VISTA 5 · MAESTROS (todo editable)
    ========================================================================= */
-let MSEC="tecnicos";
+let MSEC="tiempos";
 let RAPIDO=false;
 let MFILTRO={cuarto:"", tipo:""};
 function vMaestros(){
-  const secciones=[["tecnicos","Técnicos"],["cuartos","Cuartos"],["tiposComponente","Tipos de componente"],["tipologias","Tipologías"],["actividades","Actividades"],["estandares","Tiempos estándar"],["reparto","Reparto del proceso"],["listas","Listas"]];
+  const secciones=[["tiempos","Tiempos"],["tecnicos","Técnicos"],["cuartos","Cuartos"],["tiposComponente","Tipos de componente"],["tipologias","Tipologías"],["actividades","Actividades"],["listas","Listas"],["estandares","Tabla completa"],["reparto","Reparto (avanzado)"]];
   return `
   <div class="card"><header><h2>Maestros</h2><span class="sub">Todo lo que aparece en el registro sale de aquí</span></header>
   <div class="body"><div class="seg">${secciones.map(([k,l])=>`<button data-ms="${k}" class="${MSEC===k?"on":""}">${l}</button>`).join("")}</div>
@@ -2242,7 +2373,7 @@ function vMaestros(){
     <input type="checkbox" id="modoRapido" ${RAPIDO?"checked":""} style="width:17px;height:17px;accent-color:var(--signal)">
     <span>Borrado rápido — elimina sin preguntar lo que no tenga datos asociados. Útil para limpiar los ejemplos de una vez.</span></label>
   </div></div>
-  ${{tecnicos:mTecnicos,cuartos:mCuartos,tiposComponente:mTipos,tipologias:mTipologias,actividades:mActividades,estandares:mEstandares,reparto:mReparto,listas:mListas}[MSEC]()}`;
+  ${({tiempos:mTiempos,tecnicos:mTecnicos,cuartos:mCuartos,tiposComponente:mTipos,tipologias:mTipologias,actividades:mActividades,estandares:mEstandares,reparto:mReparto,listas:mListas}[MSEC]||mTiempos)()}`;
 }
 function mTecnicos(){
   return `<div class="card"><header><h2>Técnicos</h2><div class="push"><button class="btn sm primary" data-add="tecnico">+ Técnico</button></div></header>
@@ -2603,7 +2734,7 @@ function modalEnlaceTecnicos(){
 function modalFusionTipo(id){
   const t=byId(DB.tiposComponente,id); if(!t) return;
   const comps=DB.componentes.filter(c=>c.tipoComponenteId===id).length;
-  const regs=DB.registros.filter(r=>{const c=byId(DB.componentes,r.componenteId); return c&&c.tipoComponenteId===id;}).length;
+  const regs=DB.registros.filter(r=>{const c=fotoComponente(r); return c&&c.tipoComponenteId===id;}).length;
   const otros=DB.tiposComponente.filter(x=>x.id!==id).sort((a,b)=>a.nombre.localeCompare(b.nombre,"es"));
   abrirModal("Fusionar “"+t.nombre+"”", `
     <p class="hint" style="margin-top:0">Para unir duplicados: <b>Riel</b> y <b>Riel Common Rail</b> son el mismo componente.
@@ -2746,6 +2877,239 @@ function modalCuartosActividad(id){
       };
     });
 }
+/* =========================================================================
+   EDITOR DE TIEMPOS POR COMPONENTE
+   Una sola pantalla: eliges cuarto y componente, y ves cada actividad con
+   sus minutos al frente. Marcar/desmarcar decide si el técnico la ve.
+   Los porcentajes ya no se escriben: se deducen de los minutos.
+   ========================================================================= */
+let TE = {cuarto:"", tipo:"", avanzado:false};
+
+function faseDe(a){
+  const f=(a.fase||"").toLowerCase();
+  if(f.indexOf("diagn")===0) return "Diagnóstico";
+  if(f.indexOf("entrega")===0) return "Entrega";
+  if(f.indexOf("apoyo")===0) return "Apoyo";
+  return "Reparación";
+}
+function estandarDe(tc, actId){
+  return DB.estandares.find(e=>e.tipoComponenteId===tc && e.tipologiaId==="*" && e.actividadId===actId);
+}
+function mTiempos(){
+  const cuartos=DB.cuartos.filter(c=>c.tipo==="principal"||DB.tiposComponente.some(t=>t.cuartoId===c.id));
+  if(!TE.cuarto) TE.cuarto=(cuartos[0]||{}).id||"";
+  const tipos=DB.tiposComponente.filter(t=>t.cuartoId===TE.cuarto);
+  if(!tipos.some(t=>t.id===TE.tipo)) TE.tipo=(tipos[0]||{}).id||"";
+  const tipo=byId(DB.tiposComponente,TE.tipo);
+
+  const cab=`<div class="card"><header><h2>Tiempos por componente</h2>
+    <span class="sub">Escribe los minutos de cada paso. Los porcentajes se calculan solos.</span></header>
+  <div class="body"><div class="row">
+    <label class="f"><span>Cuarto</span><select id="teCuarto">
+      ${cuartos.map(c=>`<option value="${c.id}" ${TE.cuarto===c.id?"selected":""}>${esc(c.nombre)}</option>`).join("")}</select></label>
+    <label class="f"><span>Componente</span><select id="teTipo">
+      ${tipos.map(t=>`<option value="${t.id}" ${TE.tipo===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</select></label>
+  </div></div></div>`;
+
+  if(!tipo) return cab+`<div class="card"><div class="body"><div class="empty">Este cuarto no tiene componentes. Créalos en Tipos de componente.</div></div></div>`;
+
+  const r=resumenTiempos(tipo.id);
+  const meta=+tipo.estandarReparacion||0;         /* lo que la empresa dice que vale la reparación */
+  const cuadra = !meta || r.reparacion===meta;
+  const acts=actividadesDe(tipo.cuartoId).filter(a=>!a.noProductiva);
+  const usados=DB.componentes.filter(c=>c.tipoComponenteId===tipo.id).length;
+  const regs=DB.registros.filter(x=>!x.anulado && fotoComponente(x) && fotoComponente(x).tipoComponenteId===tipo.id).length;
+
+  const FASES=["Diagnóstico","Reparación","Entrega"];
+  const fila=a=>{
+    const e=estandarDe(tipo.id,a.id);
+    const min=e?(+e.minutos||0):0;
+    const activa=!!e;
+    const pct=pesoActividad(tipo.id,a.id);
+    return `<tr class="${activa?"":"apagada"}">
+      <td style="width:36px"><input type="checkbox" data-teon="${a.id}" ${activa?"checked":""} style="width:18px;height:18px;accent-color:var(--signal)"></td>
+      <td><b>${esc(a.nombre)}</b>${esPorOrden(a.id)?' <span class="tag">por orden, no por unidad</span>':""}
+        <br><select data-tefase="${a.id}" style="font-size:12px;padding:2px 4px;margin-top:3px">
+          ${FASES.map(f=>`<option value="${f}" ${faseDe(a)===f?"selected":""}>${f}</option>`).join("")}</select>
+        ${activa?`<label style="font-size:12px;margin-left:8px;white-space:nowrap;cursor:pointer">
+          <input type="checkbox" data-teaparte="${a.id}" ${e.aparte?"checked":""} style="vertical-align:-2px"> aparte</label>`:""}</td>
+      <td class="num" style="width:110px"><input type="number" min="0" step="1" data-temin="${a.id}" value="${min}" ${activa?"":"disabled"} style="text-align:right"></td>
+      <td class="num mono" style="width:70px">${!activa?"—":(e.aparte?'<span class="tag">aparte</span>':(pct?pct.toFixed(1)+"%":"—"))}</td></tr>`;
+  };
+
+  const bloque=(titulo,lista,suma,extra)=>lista.length?`
+    <tr class="cab"><td></td><td><b>${titulo}</b>${extra||""}</td>
+      <td class="num mono"><b>${suma}</b></td><td class="num mono">${r.total?(suma/r.total*100).toFixed(1)+"%":""}</td></tr>
+    ${lista.map(fila).join("")}`:"";
+
+  const esAparte=a=>{ const e=estandarDe(tipo.id,a.id); return !!(e && e.aparte); };
+  const dg=acts.filter(a=>!esAparte(a) && faseDe(a)==="Diagnóstico");
+  const rp=acts.filter(a=>!esAparte(a) && faseDe(a)==="Reparación");
+  const en=acts.filter(a=>!esAparte(a) && faseDe(a)==="Entrega");
+  const ap=acts.filter(esAparte);
+
+  return cab+`
+  <div class="card"><header><h2>${esc(tipo.nombre)}</h2>
+    <span class="sub mono">${usados} en órdenes · ${regs} registros</span></header>
+  <div class="body">
+    <label class="f" style="max-width:340px"><span>Estándar de la empresa para la REPARACIÓN (min)</span>
+      <input type="number" min="0" step="1" id="teMeta" value="${meta||""}" placeholder="ej. 60"></label>
+    <p class="hint" style="margin-top:-4px">El diagnóstico y la entrega van aparte. Si dejas esto vacío, no se valida nada.</p>
+
+    <div class="tw"><table class="acc"><thead><tr>
+      <th style="width:36px">Usa</th><th>Actividad</th><th class="num">Minutos</th><th class="num">% proceso</th>
+    </tr></thead><tbody>
+      ${bloque("DIAGNÓSTICO",dg,r.diagnostico)}
+      ${bloque("REPARACIÓN",rp,r.reparacion, meta?` <span class="chip ${cuadra?"c-verde":"c-rojo"}">${cuadra?"cuadra con "+meta:"deberían ser "+meta+" · "+(r.reparacion>meta?"sobran "+(r.reparacion-meta):"faltan "+(meta-r.reparacion))}</span>`:"")}
+      ${bloque("ENTREGA",en,r.entrega)}
+      <tr class="cab"><td></td><td><b>TOTAL DEL PROCESO</b></td>
+        <td class="num mono"><b>${r.total}</b></td><td class="num mono">${hrs(r.total)} h</td></tr>
+      ${ap.length?`<tr class="cab"><td></td><td><b>APARTE</b> <span class="tag">no suman al proceso · el técnico las marca solo cuando aplican</span></td><td></td><td></td></tr>
+      ${ap.map(fila).join("")}`:""}
+    </tbody></table></div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:13px">
+      <button class="btn primary" id="teGuardar">Guardar y aplicar a los registros</button>
+      <button class="btn" id="teCopiar">Copiar estos tiempos a otro componente…</button>
+    </div>
+    <p class="hint">Al guardar se recalculan las horas ganadas de los ${regs} registros de este componente, hacia atrás.</p>
+
+    ${(()=>{const tips=DB.estandares.filter(e=>e.tipoComponenteId===tipo.id && e.tipologiaId!=="*" && e.actividadId===ACT_TOTAL);
+      return `<hr class="sep"><div class="eyebrow" style="margin-bottom:6px">Variantes que tardan distinto</div>
+      <p class="hint" style="margin-top:0">Una tipología puede tener otro total (un biturbo tarda 5 h y no 3). Los pasos se escalan solos.</p>
+      ${tips.length?`<div class="tw"><table><tbody>${tips.map(e=>`<tr>
+        <td>${esc(nom(DB.tipologias,e.tipologiaId))}</td>
+        <td class="num" style="width:110px"><input type="number" min="0" step="1" data-tetip="${e.id}" value="${e.minutos}"></td>
+        <td class="num mono" style="width:70px">${hrs(e.minutos)} h</td>
+        <td style="width:44px"><button class="btn sm danger" data-tedel="${e.id}">×</button></td></tr>`).join("")}</tbody></table></div>`:`<p class="hint">Ninguna por ahora.</p>`}
+      <button class="btn sm" id="teAddTip" style="margin-top:8px">+ Variante</button>`;})()}
+
+    <hr class="sep">
+    <details ${TE.avanzado?"open":""}><summary style="cursor:pointer;font-size:13px;font-weight:600">Avanzado · reparto por porcentaje</summary>
+      <p class="hint">Solo hace falta cuando de un componente conoces el total pero no el detalle de cada paso.
+      Como aquí ya hay minutos escritos, la app deduce los porcentajes sola y esto no se usa.
+      ${(DB.repartos||[]).filter(x=>x.tipoComponenteId===tipo.id).length
+        ? `Este componente todavía tiene ${(DB.repartos||[]).filter(x=>x.tipoComponenteId===tipo.id).length} porcentaje(s) escritos a mano.
+           <br><button class="btn sm warn" id="teLimpiarRep" style="margin-top:8px">Quitarlos</button>`
+        : "No tiene porcentajes escritos. Perfecto."}</p>
+    </details>
+  </div></div>`;
+}
+function pTiempos(){
+  const cu=$("#teCuarto"); if(cu) cu.onchange=e=>{ TE.cuarto=e.target.value; TE.tipo=""; render(); };
+  const tp=$("#teTipo");   if(tp) tp.onchange=e=>{ TE.tipo=e.target.value; render(); };
+
+  /* Encender / apagar una actividad para este componente */
+  document.querySelectorAll("[data-teon]").forEach(ch=>ch.onchange=()=>{
+    const actId=ch.dataset.teon, tc=TE.tipo;
+    commitMaestro(()=>{
+      if(ch.checked){
+        if(!estandarDe(tc,actId)) DB.estandares.push({id:uid("es"),tipoComponenteId:tc,tipologiaId:"*",actividadId:actId,minutos:0});
+      } else {
+        DB.estandares=DB.estandares.filter(e=>!(e.tipoComponenteId===tc && e.tipologiaId==="*" && e.actividadId===actId));
+      }
+    }, ch.checked?"Actividad activada":"Actividad quitada de este componente");
+  });
+
+  /* Minutos: se escriben sin redibujar hasta salir del campo */
+  document.querySelectorAll("[data-temin]").forEach(i=>i.onchange=()=>{
+    const actId=i.dataset.temin, tc=TE.tipo, v=Math.max(0,+i.value||0);
+    commitMaestro(()=>{
+      const e=estandarDe(tc,actId);
+      if(e) e.minutos=v;
+      else DB.estandares.push({id:uid("es"),tipoComponenteId:tc,tipologiaId:"*",actividadId:actId,minutos:v});
+    },"", true);
+    render();
+  });
+
+  document.querySelectorAll("[data-tefase]").forEach(sel=>sel.onchange=()=>{
+    const actId=sel.dataset.tefase, v=sel.value;
+    commitMaestro(()=>{ const a=byId(DB.actividades,actId); if(a) a.fase=v; },"Fase actualizada");
+  });
+  document.querySelectorAll("[data-teaparte]").forEach(ch=>ch.onchange=()=>{
+    const actId=ch.dataset.teaparte;
+    commitMaestro(()=>{ const e=estandarDe(TE.tipo,actId); if(e) e.aparte=ch.checked; },
+      ch.checked?"Queda aparte del proceso":"Vuelve a contar en el proceso");
+  });
+  const mt=$("#teMeta"); if(mt) mt.onchange=()=>{
+    const v=Math.max(0,+mt.value||0);
+    commitMaestro(()=>{ const t=byId(DB.tiposComponente,TE.tipo); if(t) t.estandarReparacion=v; },"Estándar guardado");
+  };
+
+  document.querySelectorAll("[data-tetip]").forEach(i=>i.onchange=()=>{
+    const id=i.dataset.tetip, v=Math.max(0,+i.value||0);
+    commitMaestro(()=>{ const e=byId(DB.estandares,id); if(e) e.minutos=v; },"Variante guardada");
+  });
+  document.querySelectorAll("[data-tedel]").forEach(b=>b.onclick=()=>{
+    const id=b.dataset.tedel;
+    commitMaestro(()=>{ DB.estandares=DB.estandares.filter(e=>e.id!==id); },"Variante eliminada");
+  });
+  const at=$("#teAddTip"); if(at) at.onclick=()=>modalVariante(TE.tipo);
+
+  const lr=$("#teLimpiarRep"); if(lr) lr.onclick=()=>commitMaestro(()=>{
+    DB.repartos=(DB.repartos||[]).filter(x=>x.tipoComponenteId!==TE.tipo);
+  },"Porcentajes quitados · ahora se deducen de los minutos");
+
+  const gd=$("#teGuardar"); if(gd) gd.onclick=()=>recalcularDeTipo(TE.tipo);
+  const cp=$("#teCopiar");  if(cp) cp.onclick=()=>modalCopiarTiempos(TE.tipo);
+}
+/* Recalcula las horas ganadas de todos los registros de un tipo de componente. */
+async function recalcularDeTipo(tc){
+  const afectados=DB.registros.filter(r=>{ const c=fotoComponente(r); return c && c.tipoComponenteId===tc; });
+  let cambian=0;
+  afectados.forEach(r=>{ if(stdRegistro(fotoComponente(r), r.actividadId, r.cantidad)!==r.minutosStd) cambian++; });
+  if(!afectados.length){ toast("Guardado. Este componente todavía no tiene registros"); return; }
+  if(!await confirmar("Aplicar a los registros",
+    `${afectados.length} registro(s) de ${nom(DB.tiposComponente,tc)}.\n\nCambiarían las horas ganadas de ${cambian}.\n\nNo se toca el tiempo real que puso el técnico: solo la parte estándar.`,
+    "Aplicar")) return;
+  await commit(()=>{
+    DB.registros.forEach(r=>{
+      const c=fotoComponente(r); if(!c || c.tipoComponenteId!==tc) return;
+      r.minutosStd=stdRegistro(c, r.actividadId, r.cantidad);
+      r.actualizado=new Date().toISOString();
+    });
+  }, cambian+" registros actualizados");
+  empujarRegistros().catch(()=>{});
+}
+function modalVariante(tc){
+  const tipo=byId(DB.tiposComponente,tc);
+  const ya=new Set(DB.estandares.filter(e=>e.tipoComponenteId===tc&&e.actividadId===ACT_TOTAL).map(e=>e.tipologiaId));
+  const opts=tipologiasDe(tc).concat(tipologiasOtras(tc)).filter(t=>!ya.has(t.id));
+  const base=resumenTiempos(tc).total||0;
+  abrirModal("Variante que tarda distinto", `
+    <p class="hint" style="margin-top:0">Hoy ${esc(tipo.nombre)} vale <b>${base} min</b> en total. Elige la tipología que se sale de ese tiempo y escribe el suyo.</p>
+    <label class="f"><span>Tipología</span><select id="mvTip" style="font-size:15px;padding:10px">
+      ${opts.map(t=>`<option value="${t.id}">${esc(t.nombre)}</option>`).join("")}</select></label>
+    <label class="f"><span>Total del proceso (min)</span><input type="number" min="0" step="1" id="mvMin" value="${base}"></label>
+    <button class="btn primary" id="mvOk">Agregar</button>`,
+    d=>{ d.querySelector("#mvOk").onclick=()=>{
+      const tip=d.querySelector("#mvTip").value, m=Math.max(0,+d.querySelector("#mvMin").value||0);
+      if(!tip||!m){ toast("Elige tipología y minutos"); return; }
+      cerrarModal();
+      commitMaestro(()=>{ DB.estandares.push({id:uid("es"),tipoComponenteId:tc,tipologiaId:tip,actividadId:ACT_TOTAL,minutos:m}); },"Variante agregada");
+    };});
+}
+function modalCopiarTiempos(tc){
+  const origen=byId(DB.tiposComponente,tc);
+  const otros=DB.tiposComponente.filter(t=>t.id!==tc);
+  abrirModal("Copiar tiempos de "+origen.nombre, `
+    <p class="hint" style="margin-top:0">Útil cuando dos componentes se trabajan igual. Se reemplazan los tiempos del destino.</p>
+    <label class="f"><span>Copiar a</span><select id="mcDest" style="font-size:15px;padding:10px">
+      ${otros.map(t=>`<option value="${t.id}">${esc(t.nombre)} · ${esc(nom(DB.cuartos,t.cuartoId))}</option>`).join("")}</select></label>
+    <button class="btn primary" id="mcOk">Copiar</button>`,
+    d=>{ d.querySelector("#mcOk").onclick=async()=>{
+      const dest=d.querySelector("#mcDest").value; if(!dest) return;
+      const dn=nom(DB.tiposComponente,dest);
+      cerrarModal();
+      if(!await confirmar("Copiar tiempos",`Los tiempos de ${dn} se reemplazan por los de ${origen.nombre}.`,"Copiar")) return;
+      commitMaestro(()=>{
+        DB.estandares=DB.estandares.filter(e=>!(e.tipoComponenteId===dest && e.tipologiaId==="*"));
+        minutosPropios(tc).forEach(e=>DB.estandares.push({id:uid("es"),tipoComponenteId:dest,tipologiaId:"*",actividadId:e.actividadId,minutos:e.minutos}));
+        const t=byId(DB.tiposComponente,dest), o=byId(DB.tiposComponente,tc);
+        if(t&&o) t.estandarReparacion=o.estandarReparacion||0;
+      },"Tiempos copiados a "+dn);
+    };});
+}
 function mEstandares(){
   const tiposVis = MFILTRO.cuarto ? DB.tiposComponente.filter(t=>t.cuartoId===MFILTRO.cuarto) : DB.tiposComponente;
   const idsVis = new Set(tiposVis.map(t=>t.id));
@@ -2814,7 +3178,7 @@ async function recalcularEstandares(){
   const regs=DB.registros;
   let cambiados=0, ceros=0;
   const nuevos=regs.map(r=>{
-    const c=byId(DB.componentes,r.componenteId);
+    const c=fotoComponente(r);
     const std = stdRegistro(c, r.actividadId, r.cantidad);
     if(std!==r.minutosStd) cambiados++;
     if(!std) ceros++;
@@ -3024,6 +3388,7 @@ function pMaestros(){
     commitMaestro(()=>{ DB.estandares=DB.estandares.filter(e=>e.actividadId===ACT_TOTAL); },"Listo, solo quedan los totales");
   };
   const rec=$("#recalcEstd"); if(rec) rec.onclick=()=>recalcularEstandares();
+  if(MSEC==="tiempos") pTiempos();
   const rpg=$("#rpGuardar");
   if(rpg) rpg.onclick=()=>{
     const tcSel = MFILTRO.tipo || "*";
@@ -3256,6 +3621,24 @@ function importarEstandares(){
 }
 
 /* Revisión previa: qué falta para que los indicadores funcionen. */
+/* Registros que quedaron sin poder valorarse: sin componente ni foto, o con
+   una actividad que ya no existe. Son los que "no ganan horas" en el informe. */
+function registrosRotos(){
+  const rs=RA();
+  return {
+    sinComponente: rs.filter(r=>!r.sinOrden && !fotoComponente(r)),
+    sinActividad:  rs.filter(r=>!byId(DB.actividades, r.actividadId)),
+    sinEstandar:   rs.filter(r=>!r.minutosStd && !esNoProductiva(r.actividadId))
+  };
+}
+/* Dos maestros que en la práctica son el mismo: "Balanceo" y "Balanceo ",
+   "tobera" y "toberas". Reparten las horas en dos filas del informe. */
+function casiDuplicados(col){
+  const nk=x=>sinTildes(x).replace(/[^a-z0-9]/g,"").replace(/s$/,"");
+  const g={};
+  (DB[col]||[]).forEach(x=>{ const k=nk(x.nombre||""); if(!k) return; (g[k]=g[k]||[]).push(x); });
+  return Object.values(g).filter(v=>v.length>1);
+}
 function chequeos(){
   const c=[]; const cx=DB.meta.conexion||{};
   const activos=DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador");
@@ -3290,20 +3673,22 @@ function chequeos(){
       : `${enUso.length} componentes en órdenes abiertas, todos con tiempo`,
     donde:"Datos → Cargar tabla de tiempos"});
 
-  const conTotal=enUso.filter(id=>totalProceso(id,"*"));
-  const malReparto=conTotal.filter(id=>sumaReparto(id)!==100);
-  c.push({critico:true, ok:conTotal.length>0 && malReparto.length===0, titulo:"Reparto del proceso al 100%",
-    detalle: !conTotal.length? "todavía no hay tiempos totales"
-      : malReparto.length? malReparto.slice(0,4).map(id=>nom(DB.tiposComponente,id)+": "+sumaReparto(id)+"%").join(" · ")
-      : "todos los procesos suman 100%",
-    donde:"Maestros → Reparto del proceso"});
+  /* La reparación de cada componente debe cuadrar con el estándar de la empresa. */
+  const conMeta=enUso.filter(id=>{const t=byId(DB.tiposComponente,id); return t && +t.estandarReparacion>0;});
+  const descuadran=conMeta.filter(id=>resumenTiempos(id).reparacion!==+byId(DB.tiposComponente,id).estandarReparacion);
+  c.push({critico:true, ok:conMeta.length>0 && descuadran.length===0, titulo:"La reparación cuadra con el estándar",
+    detalle: !conMeta.length? "ningún componente tiene escrito su estándar de reparación"
+      : descuadran.length? descuadran.slice(0,4).map(id=>{const t=byId(DB.tiposComponente,id);
+          return t.nombre+": "+resumenTiempos(id).reparacion+" de "+t.estandarReparacion;}).join(" · ")
+      : conMeta.length+" componentes cuadran con su estándar",
+    donde:"Maestros → Tiempos"});
 
   /* actividades que el técnico verá y que no ganan horas */
   const sinValor=[];
   DB.cuartos.filter(cu=>cu.tipo==="principal").forEach(cu=>{
     const tipos=DB.tiposComponente.filter(t=>t.cuartoId===cu.id);
     actividadesDe(cu.id).filter(a=>!a.noProductiva).forEach(a=>{
-      const vale=tipos.some(t=>estandarMin(t.id,"*",a.id)>0);
+      const vale=tipos.some(t=>estandarMin(t.id,"*",a.id)>0 || pesoActividad(t.id,a.id)>0);
       if(!vale && tipos.length) sinValor.push(cu.nombre+" · "+a.nombre);
     });
   });
@@ -3312,6 +3697,25 @@ function chequeos(){
       ? `${sinValor.length} no valen nada: ${sinValor.join("  ·  ")}`
       : "todas las actividades tienen tiempo propio o porcentaje",
     donde:"Maestros → Tiempos estándar o Reparto"});
+
+  /* --- salud de los registros ya guardados --- */
+  const rot=registrosRotos();
+  c.push({critico:true, ok:rot.sinComponente.length===0 && rot.sinActividad.length===0,
+    titulo:"Registros con su componente y su actividad",
+    detalle: (rot.sinComponente.length||rot.sinActividad.length)
+      ? [rot.sinComponente.length?rot.sinComponente.length+" sin componente (no ganan horas)":"",
+         rot.sinActividad.length?rot.sinActividad.length+" con una actividad borrada":""].filter(Boolean).join(" · ")
+      : `los ${RA().length} registros están completos`,
+    donde:"Datos → Reparar registros"});
+
+  const dupAct=casiDuplicados("actividades");
+  const dupTipo=casiDuplicados("tiposComponente");
+  c.push({critico:false, ok:dupAct.length===0 && dupTipo.length===0,
+    titulo:"Maestros sin nombres repetidos",
+    detalle: (dupAct.length||dupTipo.length)
+      ? [...dupAct,...dupTipo].slice(0,3).map(g=>g.map(x=>'"'+x.nombre+'"').join(" = ")).join(" · ")
+      : "no hay actividades ni componentes con el mismo nombre",
+    donde:"Maestros → Actividades (botón Fusionar)"});
 
   c.push({critico:false, ok:cx.modo==="script", titulo:"Puente con Google conectado",
     detalle: cx.modo==="script"? "las órdenes bajan y los registros suben solos"
@@ -3349,6 +3753,277 @@ function panelChequeos(){
     </div></div>`;
 }
 
+/* -------------------------------------------------------------------------
+   REPARAR REGISTROS
+   Un registro vale horas solo si sabe QUÉ componente se trabajó y QUÉ
+   actividad se hizo. Si una de las dos se perdió (la orden se recreó, la
+   actividad se borró), el registro sigue ahí pero suma cero.
+   Aquí se ven y se arreglan en bloque.
+------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+   LECTURA DEL BLOQUE DE REGISTROS_APP
+   Google Sheets no siempre deja copiar la fila de encabezados (sobre todo
+   desde el historial de versiones). Por eso, si no aparecen, las columnas se
+   reconocen por su CONTENIDO:
+     · la de id     -> celdas que empiezan por "rg_"
+     · la de crudo  -> celdas que empiezan por "{"
+     · la de OT     -> números de 3 a 7 cifras que no son fechas ni cantidades
+     · la de comp.  -> textos que coinciden con un tipo de componente conocido
+   Siempre se muestra lo detectado antes de aplicar nada.
+-------------------------------------------------------------------------- */
+function detectarColumnasRegistros(filas){
+  const enc = (filas[0]||[]).map(h=>sinTildes(String(h||"")).trim());
+  const tiene = n=>enc.indexOf(n);
+  if(tiene("id")>=0 && tiene("ot")>=0){
+    return {desdeFila:1, id:tiene("id"), ot:tiene("ot"), componente:tiene("componente"),
+            cliente:tiene("cliente"), crudo:tiene("crudo"), como:"por los encabezados"};
+  }
+  /* --- sin encabezados: se mira el contenido --- */
+  const nCols = Math.max(...filas.map(f=>f.length));
+  const muestra = filas.slice(0, 200);
+  const frac = (i, test)=>{
+    let vistos=0, ok=0;
+    muestra.forEach(f=>{ const v=String(f[i]==null?"":f[i]).trim(); if(!v) return; vistos++; if(test(v)) ok++; });
+    return vistos? ok/vistos : 0;
+  };
+  const nombresTipo = new Set(DB.tiposComponente.map(t=>sinTildes(t.nombre)));
+  let id=-1, crudo=-1, ot=-1, componente=-1, cliente=-1;
+  for(let i=0;i<nCols;i++){
+    if(id<0    && frac(i,v=>/^rg_/i.test(v))>0.6) id=i;
+    if(crudo<0 && frac(i,v=>v.charAt(0)==="{")>0.6) crudo=i;
+    if(componente<0 && frac(i,v=>nombresTipo.has(sinTildes(v)))>0.3) componente=i;
+  }
+  /* OT: columna de números largos que no sea fecha ni cantidad */
+  let mejor=-1, mejorLargo=0;
+  for(let i=0;i<nCols;i++){
+    if(i===id||i===crudo||i===componente) continue;
+    if(frac(i,v=>/^\d{4}-\d{2}-\d{2}/.test(v))>0.3) continue;          /* fecha */
+    const f=frac(i,v=>/^[A-Za-z0-9\-]{3,12}$/.test(v) && (v.match(/\d/g)||[]).length>=3);
+    if(f<0.5) continue;
+    let sum=0,c=0;
+    muestra.forEach(x=>{ const v=String(x[i]==null?"":x[i]).trim(); if(v){ sum+=(v.match(/\d/g)||[]).length; c++; } });
+    const largo=c?sum/c:0;
+    if(largo>mejorLargo){ mejorLargo=largo; mejor=i; }                  /* la de cifras más largas */
+  }
+  ot=mejor;
+  if(id<0 || ot<0) return null;
+  return {desdeFila:0, id, ot, componente, cliente, crudo, como:"por el contenido de las columnas (no venían encabezados)"};
+}
+/* Rescata el número de OT desde un pegado de REGISTROS_APP (por ejemplo, de
+   una versión anterior de la hoja). Solo rellena lo que está vacío: nunca
+   pisa un dato bueno que ya tenga la app, así que se pueden pegar varias
+   versiones seguidas y cada una tapa los huecos que dejó la anterior.
+
+   Además usa la columna "crudo" como puente: ahí viaja el ordenId interno.
+   Si UNA fila de la hoja dice que el ordenId X es la OT 34390, entonces
+   TODOS los registros de la app que apunten a X recuperan su número,
+   aunque su propia fila haya salido vacía. */
+function recuperarOTPegado(txt){
+  const t=String(txt||"").trim();
+  if(!t) return {error:"Pega primero el bloque de la hoja"};
+  const sep = t.split("\n")[0].includes("\t") ? "\t" : ",";
+  const filas = (sep==="\t" ? t.replace(/\r/g,"").split("\n").map(l=>partir(l,"\t")) : csvAFilas(t))
+    .filter(f=>f.some(x=>String(x||"").trim()!==""));
+  if(!filas.length) return {error:"No se reconoció ninguna fila"};
+  const M = detectarColumnasRegistros(filas);
+  if(!M) return {error:'No encuentro la columna del id (celdas que empiezan por "rg_") ni la del OT. Copia el bloque incluyendo la columna id y la columna ot.'};
+  const iId=M.id, iOt=M.ot, iComp=M.componente, iCli=M.cliente, iCru=M.crudo;
+
+  /* --- paso 1: lo que dice cada fila, y el puente por ordenId --- */
+  const porFila=new Map();            /* id de registro  -> {ot, cliente, comp} */
+  const porOrden=new Map();           /* ordenId interno -> {ot, cliente} */
+  const porComp=new Map();            /* componenteId    -> nombre del componente */
+  let vacios=0;
+  filas.slice(M.desdeFila).forEach(f=>{
+    const id=String(f[iId]||"").trim(); if(!id) return;
+    const vOt=String(f[iOt]||"").trim();
+    const vComp=iComp>=0?String(f[iComp]||"").trim():"";
+    const vCli=iCli>=0?String(f[iCli]||"").trim():"";
+    if(!vOt && !vComp) vacios++;
+    if(vOt||vComp) porFila.set(id,{ot:vOt, cliente:vCli, comp:vComp});
+    if(iCru>=0){
+      let cr=null; try{ cr=JSON.parse(String(f[iCru]||"")); }catch(e){}
+      if(cr){
+        if(cr.ordenId && vOt && !porOrden.has(cr.ordenId)) porOrden.set(cr.ordenId,{ot:vOt, cliente:vCli});
+        if(cr.componenteId && vComp && !porComp.has(cr.componenteId)) porComp.set(cr.componenteId, vComp);
+      }
+    }
+  });
+
+  /* --- paso 2: qué le sirve a cada registro de la app --- */
+  let ot=0, otPuente=0, comp=0, noEstan=0;
+  const vistos=new Set(DB.registros.map(r=>r.id));
+  porFila.forEach((v,id)=>{ if(!vistos.has(id)) noEstan++; });
+  const cambios=[];
+  DB.registros.forEach(r=>{
+    const c={id:r.id};
+    const propia=porFila.get(r.id);
+    if(!r.otTexto){
+      if(propia && propia.ot){ c.otTexto=propia.ot; ot++; }
+      else if(r.ordenId && porOrden.has(r.ordenId)){ c.otTexto=porOrden.get(r.ordenId).ot; otPuente++; }
+    }
+    if(!r.compTexto){
+      if(propia && propia.comp){ c.compTexto=propia.comp; comp++; }
+      else if(r.componenteId && porComp.has(r.componenteId)){ c.compTexto=porComp.get(r.componenteId); comp++; }
+    }
+    if(Object.keys(c).length>1) cambios.push(c);
+  });
+  const ejemplo = filas.slice(M.desdeFila).find(f=>String(f[iOt]||"").trim());
+  return {ot, otPuente, comp, noEstan, vacios, cambios, filas:filas.length-M.desdeFila,
+          puentes:porOrden.size, como:M.como,
+          ejemploOT: ejemplo? String(ejemplo[iOt]).trim() : "",
+          ejemploId: ejemplo? String(ejemplo[iId]).trim() : ""};
+}
+/* Reconecta a su orden todos los registros sueltos que ya tengan número de OT.
+   Devuelve el plan; no toca nada hasta que se confirma. */
+function planReenganche(){
+  return registrosRotos().sinComponente.filter(r=>r.otTexto).map(r=>{
+    const o=DB.ordenes.find(x=>x.ot===r.otTexto && (!r.cuartoId||(x.cuartoDeclaradoId||"")===r.cuartoId))
+         || DB.ordenes.find(x=>x.ot===r.otTexto);
+    if(!o) return null;
+    const cands=DB.componentes.filter(c=>c.ordenId===o.id);
+    if(!cands.length) return null;
+    /* Se prefiere el componente que coincide en nombre; si no, el del cuarto
+       donde trabajó el técnico; si no, el único que haya. */
+    const c = (r.compTexto && cands.find(x=>nom(DB.tiposComponente,x.tipoComponenteId)===r.compTexto))
+           || (r.cuartoId && cands.find(x=>x.cuartoId===r.cuartoId)) || cands[0];
+    return {id:r.id, ordenId:o.id, componenteId:c.id};
+  }).filter(Boolean);
+}
+function aplicarReenganche(plan){
+  const m={}; plan.forEach(p=>m[p.id]=p);
+  DB.registros.forEach(r=>{
+    const p=m[r.id]; if(!p) return;
+    r.ordenId=p.ordenId; r.componenteId=p.componenteId;
+    const c=byId(DB.componentes,p.componenteId);
+    const o=byId(DB.ordenes,p.ordenId);
+    if(o) r.otTexto=o.ot;                         /* queda escrito: no se vuelve a perder */
+    if(c){ r.tipoComponenteId=c.tipoComponenteId; r.tipologiaId=c.tipologiaId||null;
+           r.compTexto=r.compTexto||nom(DB.tiposComponente,c.tipoComponenteId,""); }
+    r.minutosStd=stdRegistro(fotoComponente(r), r.actividadId, r.cantidad);
+    r.actualizado=new Date().toISOString();
+  });
+}
+function panelReparar(){
+  const rot=registrosRotos();
+  const nSC=rot.sinComponente.length, nSA=rot.sinActividad.length, nSE=rot.sinEstandar.length;
+  if(!nSC && !nSA && !nSE) return `<div class="card" style="border-color:#b6ddc6">
+    <header><h2>Salud de los registros</h2><span class="sub mono">${RA().length} activos</span></header>
+    <div class="body"><div style="border:1px solid #b6ddc6;background:#eaf6ef;color:var(--green);padding:10px 12px;border-radius:var(--r);font-size:13.5px">
+      <b>Todos los registros ganan horas.</b> Ninguno perdió su componente ni su actividad.</div></div></div>`;
+
+  /* actividades desaparecidas, agrupadas por el id que quedó colgando */
+  const porAct={};
+  rot.sinActividad.forEach(r=>{ (porAct[r.actividadId]=porAct[r.actividadId]||[]).push(r); });
+  const acts=DB.actividades.slice().sort((a,b)=>a.nombre.localeCompare(b.nombre));
+
+  return `<div class="card" style="border-color:#f3ccb0">
+  <header><h2>Reparar registros</h2><span class="sub mono">${nSC+nSA} por arreglar</span></header>
+  <div class="body">
+    <p class="hint" style="margin-top:0">Un registro suma horas solo si conserva su <b>componente</b> y su <b>actividad</b>. Estos las perdieron y hoy valen cero en el informe.</p>
+
+    ${nSC?`<hr class="sep">
+    <div class="eyebrow" style="margin-bottom:6px">Sin componente · ${nSC}</div>
+    <p class="hint" style="margin-top:0">La orden se volvió a crear con otro identificador interno y el registro quedó suelto. Si la OT sigue en la hoja de Google, el número vuelve al sincronizar. Los que ya lo tienen se pueden reenganchar ahora.</p>
+    <div class="tw" style="max-height:200px;overflow:auto;margin-bottom:10px"><table><thead><tr><th>Fecha</th><th>Técnico</th><th>OT guardada</th><th>Actividad</th><th class="num">Und</th></tr></thead><tbody>
+    ${rot.sinComponente.slice(0,30).map(r=>`<tr><td class="mono">${fmtFecha(r.fecha)}</td><td>${esc(nom(DB.tecnicos,r.tecnicoId))}</td>
+      <td class="mono">${r.otTexto?esc(r.otTexto):'<span class="chip c-naranja">no quedó guardada</span>'}</td>
+      <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td></tr>`).join("")}
+    ${nSC>30?`<tr><td colspan="5" class="tag">…y ${nSC-30} más</td></tr>`:""}
+    </tbody></table></div>
+    <button class="btn primary" id="repEnganchar">Reenganchar por número de OT</button>
+    <hr class="sep">
+    <div class="eyebrow" style="margin-bottom:6px">Recuperar el OT desde el historial de la hoja</div>
+    <p class="hint" style="margin-top:0">Si la columna <span class="mono">ot</span> de REGISTROS_APP quedó vacía, ábrela en <b>Archivo → Historial de versiones</b>, busca una versión de cuando todavía tenía los números, copia el bloque completo (con encabezados) y pégalo aquí. <b>Puedes pegar varias versiones, una tras otra</b>: solo se rellena lo que falta, nunca se pisa lo que ya está bien.</p>
+    <details style="margin:0 0 9px"><summary style="cursor:pointer;font-size:13px;font-weight:600">El historial no me deja copiar bien</summary>
+      <ol style="margin:8px 0 0 18px;padding:0;font-size:13.5px;color:var(--ink-2)">
+        <li>En el historial, pasa el mouse sobre la versión y pulsa los <b>tres puntos ⋮</b> → <b>Hacer una copia</b>.</li>
+        <li>Se crea una hoja nueva e independiente. La original <b>no se toca</b>.</li>
+        <li>Abre esa copia, ve a REGISTROS_APP y copia el bloque normalmente.</li>
+      </ol>
+      <p class="hint" style="margin-bottom:0">Si aun así se pierden los encabezados, no importa: la app reconoce las columnas por su contenido y te dice qué entendió antes de aplicar nada.</p>
+    </details>
+    <textarea id="recOT" style="min-height:110px;font-family:var(--mono);font-size:11px" placeholder="Pega aquí el bloque de REGISTROS_APP (id, fecha, … ot, cliente, componente, …)"></textarea>
+    <button class="btn primary" id="recOTgo" style="margin-top:9px">Recuperar OT y reenganchar</button>`:""}
+
+    ${nSA?`<hr class="sep">
+    <div class="eyebrow" style="margin-bottom:6px">Con una actividad que ya no existe · ${nSA}</div>
+    <p class="hint" style="margin-top:0">Se borró o se fusionó la actividad y estos registros quedaron apuntando al vacío. Elige a cuál pasan.</p>
+    <div class="tw"><table><thead><tr><th>Actividad perdida</th><th class="num">Registros</th><th>Pasa a</th></tr></thead><tbody>
+    ${Object.entries(porAct).map(([id,rs])=>`<tr>
+      <td class="mono">${esc(id)}<br><span class="tag">${[...new Set(rs.map(r=>nom(DB.cuartos,r.cuartoId)))].join(", ")}</span></td>
+      <td class="num mono">${rs.length}</td>
+      <td><select data-repact="${esc(id)}"><option value="">— elegir —</option>
+        ${acts.map(a=>`<option value="${a.id}">${esc(a.nombre)}</option>`).join("")}</select></td></tr>`).join("")}
+    </tbody></table></div>
+    <button class="btn primary" id="repActividades" style="margin-top:10px">Pasar los registros a la actividad elegida</button>`:""}
+
+    ${nSE?`<hr class="sep">
+    <div class="eyebrow" style="margin-bottom:6px">Sin horas estándar · ${nSE}</div>
+    <p class="hint" style="margin-top:0">Registros productivos que hoy valen cero. Después de reparar lo de arriba y de completar los tiempos en Maestros, usa <b>Recalcular horas estándar</b> en Maestros → Reparto del proceso para aplicarlo hacia atrás.</p>`:""}
+  </div></div>`;
+}
+function pRepararRegistros(){
+  const eng=$("#repEnganchar");
+  if(eng) eng.onclick=async()=>{
+    const sueltos=registrosRotos().sinComponente.filter(r=>r.otTexto);
+    if(!sueltos.length){ toast("Ninguno guarda el número de OT todavía"); return; }
+    const plan=planReenganche();
+    if(!plan.length){ toast("Ninguna de esas OT está hoy en la app"); return; }
+    if(!await confirmar("Reenganchar registros",
+      `Se van a reconectar ${plan.length} de ${sueltos.length} registros a su orden por el número de OT.\n\nDespués se recalculan sus horas estándar.`,
+      "Reenganchar")) return;
+    await commit(()=>aplicarReenganche(plan), plan.length+" registros reenganchados");
+    empujarRegistros().catch(()=>{});
+  };
+  const rec=$("#recOTgo");
+  if(rec) rec.onclick=async()=>{
+    const res=recuperarOTPegado($("#recOT").value);
+    if(res.error){ toast(res.error); return; }
+    if(!res.ot && !res.otPuente && !res.comp){ toast(`Se leyeron ${res.filas} filas, pero no aportan nada que le falte a la app`); return; }
+    if(!await confirmar("Recuperar el OT",
+      `Se leyeron ${res.filas} filas · columnas reconocidas ${res.como}.\n`+
+      (res.ejemploOT?`Ejemplo leído: el registro ${res.ejemploId} es la OT ${res.ejemploOT}. Si eso no cuadra, cancela.\n`:"")+
+      `\n`+
+      `• ${res.ot} registros recuperan su OT de su propia fila\n`+
+      (res.otPuente?`• ${res.otPuente} más lo recuperan por la columna "crudo" (misma orden)\n`:"")+
+      (res.comp?`• ${res.comp} recuperan el nombre del componente\n`:"")+
+      (res.vacios?`• ${res.vacios} venían con el OT vacío (se ignoran)\n`:"")+
+      (res.noEstan?`• ${res.noEstan} no están en esta app (se ignoran)\n`:"")+
+      `\nDespués se reenganchan a su orden y se recalculan las horas.`,
+      "Recuperar")) return;
+    let enganchados=0;
+    await commit(()=>{
+      const m=new Map(DB.registros.map(r=>[r.id,r]));
+      res.cambios.forEach(c=>{ const r=m.get(c.id); if(!r) return;
+        if(c.otTexto && !r.otTexto) r.otTexto=c.otTexto;
+        if(c.compTexto && !r.compTexto) r.compTexto=c.compTexto;
+        r.actualizado=new Date().toISOString(); });
+      const plan=planReenganche(); enganchados=plan.length;
+      aplicarReenganche(plan);
+    }, `${res.ot} OT recuperados · ${enganchados} registros reenganchados`);
+    empujarRegistros().catch(()=>{});
+  };
+  const ra=$("#repActividades");
+  if(ra) ra.onclick=async()=>{
+    const mapa={};
+    document.querySelectorAll("[data-repact]").forEach(sel=>{ if(sel.value) mapa[sel.dataset.repact]=sel.value; });
+    if(!Object.keys(mapa).length){ toast("Elige primero a qué actividad pasan"); return; }
+    const afectados=RA().filter(r=>mapa[r.actividadId]).length;
+    if(!await confirmar("Cambiar la actividad",
+      `${afectados} registros pasan a: ${[...new Set(Object.values(mapa))].map(id=>nom(DB.actividades,id)).join(", ")}.\n\nSe recalculan sus horas estándar.`,
+      "Cambiar")) return;
+    await commit(()=>{
+      DB.registros.forEach(r=>{
+        const destino=mapa[r.actividadId]; if(!destino) return;
+        r.actividadId=destino;
+        r.minutosStd=stdRegistro(fotoComponente(r), destino, r.cantidad);
+        r.actualizado=new Date().toISOString();
+      });
+    }, afectados+" registros corregidos");
+    empujarRegistros().catch(()=>{});
+  };
+}
 function vDatos(){
   return `
   <details class="help" open><summary>Cómo traer las órdenes desde PROGRAMACION_LABORATORIO</summary>
@@ -3371,6 +4046,8 @@ function vDatos(){
   </div></div>
 
   ${panelChequeos()}
+
+  ${panelReparar()}
 
   ${vImportEstandares()}
 
@@ -3441,6 +4118,7 @@ function mapeo(){
   <button class="btn primary" id="importar" style="margin-top:11px">Importar</button>`;
 }
 function pDatos(){
+  pRepararRegistros();
   $("#pegado").oninput=e=>IMP.texto=e.target.value;
   $("#leer").onclick=()=>{
     const txt=IMP.texto.trim(); if(!txt){toast("Pega algo primero");return;}
@@ -3473,9 +4151,9 @@ function pDatos(){
   $("#fileJson").onchange=e=>{
     const f=e.target.files[0]; if(!f) return;
     const rd=new FileReader();
-    rd.onload=()=>{ try{ const d=JSON.parse(rd.result); if(!d.meta) throw 0;
+    rd.onload=()=>{ try{ const d=JSON.parse(limpiarJson(rd.result)); if(!d.meta) throw 0;
       confirmar("Restaurar respaldo","Esto reemplaza TODOS los datos actuales por los del archivo.\n\nExporta un respaldo antes si no estás seguro.","Restaurar")
-        .then(ok=>{ if(ok){ DB=d; guardar().then(()=>{toast("Respaldo restaurado");render();}); } }); }
+        .then(ok=>{ if(ok){ DB=d; migrar(); guardar().then(()=>{toast("Respaldo restaurado");render();}); } }); }
       catch(err){ toast("El archivo no tiene el formato esperado"); } };
     rd.readAsText(f);
   };
@@ -3484,7 +4162,7 @@ function pDatos(){
     const txt=$("#pegarResp").value.trim();
     if(!txt){ toast("Pega primero el contenido del respaldo"); return; }
     let d;
-    try{ d=JSON.parse(txt); }catch(e){ toast("El texto no es un respaldo válido"); return; }
+    try{ d=JSON.parse(limpiarJson(txt)); }catch(e){ toast("El texto no es un respaldo válido"); return; }
     if(!d || !d.meta){ toast("Falta la parte 'meta': revisa que copiaste todo"); return; }
     const ok=await confirmar("Restaurar respaldo",
       `Se cargarán ${(d.tecnicos||[]).length} técnicos, ${(d.estandares||[]).length} tiempos estándar y ${(d.registros||[]).length} registros.\n\nEsto reemplaza todos los datos actuales.`,"Restaurar");
@@ -3531,7 +4209,7 @@ function normFecha(s){
 function buscarOCrear(col, nombre, extra){
   if(!nombre) return null;
   const n=nombre.trim().toLowerCase();
-  let o=DB[col].find(x=>x.nombre.trim().toLowerCase()===n);
+  let o=DB[col].find(x=>String(x.nombre||"").trim().toLowerCase()===n);
   if(!o){ o={id:uid(col.slice(0,2)),nombre:nombre.trim(),...extra}; DB[col].push(o); }
   return o;
 }
@@ -3849,13 +4527,18 @@ function importar(){
     render();
   });
 }
+/* Quita el BOM y espacios que agregan el Bloc de notas o Excel al copiar. */
+function limpiarJson(t){ return String(t==null?"":t).replace(/^\uFEFF/,"").trim(); }
 function csvCell(v){ v=String(v==null?"":v); return /[",\n;]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v; }
 /* En una vista previa dentro de un iframe el navegador bloquea las descargas.
    Ahí mostramos el contenido para copiarlo y guardarlo a mano. */
 function enVistaPrevia(){ try{ return window.self !== window.top; }catch(e){ return true; } }
 function descargaDirecta(nombre, contenido, mime){
   try{
-    const b=new Blob(["\ufeff"+contenido],{type:(mime||"text/csv")+";charset=utf-8"});
+    /* El BOM (\ufeff) es lo que hace que Excel abra bien las tildes del CSV.
+       En un JSON ese mismo BOM rompe JSON.parse: por eso solo va en CSV. */
+    const esJson = /json/i.test(mime||"") || /\.json$/i.test(nombre);
+    const b=new Blob([esJson?contenido:("\ufeff"+contenido)],{type:(mime||"text/csv")+";charset=utf-8"});
     const a=document.createElement("a"); a.href=URL.createObjectURL(b); a.download=nombre;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(a.href),1500);
@@ -3899,7 +4582,7 @@ function bajar(nombre, contenido, mime){
 function exportarCSV(regs){
   const h=["Fecha","Semana","Tecnico","Cuarto","OT","Cliente","Componente","Tipologia","Actividad","Fase","Unidades","Minutos_reales","Horas_reales","Minutos_std","Horas_std","Eficiencia_%","Tipo_novedad","Novedad","Registrado_por","Corregido_por","Correcciones"];
   const rows=regs.map(r=>{
-    const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId), a=byId(DB.actividades,r.actividadId);
+    const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r), a=byId(DB.actividades,r.actividadId);
     return [r.fecha, semanaDe(r.fecha), nom(DB.tecnicos,r.tecnicoId), nom(DB.cuartos,r.cuartoId),
       o?o.ot:"", o?o.cliente:"", c?nom(DB.tiposComponente,c.tipoComponenteId):"", c?nom(DB.tipologias,c.tipologiaId,""):"",
       a?a.nombre:"", a?a.fase:"", r.cantidad, r.minutos, hrs(r.minutos), r.minutosStd, hrs(r.minutosStd),
@@ -3932,9 +4615,27 @@ function exportarOrdenes(){
    ========================================================================= */
 let SYNC = {corriendo:false, timer:null};
 
+/* Lector de CSV que respeta los saltos de línea DENTRO de una celda.
+   Antes se cortaba por "\n" antes de mirar las comillas: una observación
+   escrita en dos renglones partía la fila y descuadraba todas las columnas. */
 function csvAFilas(txt){
-  const lineas = txt.replace(/\r/g,"").split("\n").filter(l=>l.trim()!=="");
-  return lineas.map(l=>partir(l,","));
+  const t=String(txt||"").replace(/\r\n/g,"\n").replace(/\r/g,"\n");
+  const filas=[]; let fila=[], cur="", q=false;
+  for(let i=0;i<t.length;i++){
+    const ch=t[i];
+    if(q){
+      if(ch==='"'){ if(t[i+1]==='"'){ cur+='"'; i++; } else q=false; }
+      else cur+=ch;
+    } else if(ch==='"') q=true;
+    else if(ch===","){ fila.push(cur.trim()); cur=""; }
+    else if(ch==="\n"){ fila.push(cur.trim()); cur="";
+      if(fila.some(x=>x!=="")) filas.push(fila);
+      fila=[]; }
+    else cur+=ch;
+  }
+  fila.push(cur.trim());
+  if(fila.some(x=>x!=="")) filas.push(fila);
+  return filas;
 }
 async function leerFuente(){
   const cx = DB.meta.conexion;
@@ -3968,7 +4669,7 @@ async function empujarRegistros(){
   DB.meta.registrosSubidos = new Date().toISOString();
   DB.registros.forEach(r=>{ if(!r.actualizado) r.actualizado=r.anuladoEn||new Date().toISOString(); });
   const cuerpo = JSON.stringify({accion:"registros", registros: DB.registros.map(r=>{
-    const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId), a=byId(DB.actividades,r.actividadId);
+    const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r), a=byId(DB.actividades,r.actividadId);
     return {id:r.id, fecha:r.fecha, semana:semanaDe(r.fecha), tecnico:nom(DB.tecnicos,r.tecnicoId),
       cuarto:nom(DB.cuartos,r.cuartoId), ot:o?o.ot:(r.otTexto||""), cliente:o?o.cliente:"",
       componente:c?nom(DB.tiposComponente,c.tipoComponenteId):(r.compTexto||""), tipologia:c?nom(DB.tipologias,c.tipologiaId,""):"",
@@ -3976,10 +4677,21 @@ async function empujarRegistros(){
       minutos:r.minutos, horas:+hrs(r.minutos), minutosStd:r.minutosStd, horasStd:+hrs(r.minutosStd),
       tipoNovedad:r.tipoNovedad||"", novedad:r.novedad||"", crudo:JSON.stringify({
         tecnicoId:r.tecnicoId, ordenId:r.ordenId, componenteId:r.componenteId, cuartoId:r.cuartoId,
-        actividadId:r.actividadId, estadoNuevo:r.estadoNuevo||"", creado:r.creado})};
+        actividadId:r.actividadId, estadoNuevo:r.estadoNuevo||"", creado:r.creado,
+        /* v23: lo que antes se perdía al volver de la hoja */
+        tipoComponenteId:r.tipoComponenteId||"", tipologiaId:r.tipologiaId||null,
+        cantidad:r.cantidad, minutos:r.minutos, minutosStd:r.minutosStd,
+        otTexto:r.otTexto||"", compTexto:r.compTexto||"", tiempoMedido:!!r.tiempoMedido,
+        creadoPor:r.creadoPor||"", editadoPor:r.editadoPor||"", editadoEn:r.editadoEn||"",
+        historial:r.historial||[], actualizado:r.actualizado||"",
+        anulado:!!r.anulado, anuladoPor:r.anuladoPor||"", anuladoEn:r.anuladoEn||"",
+        motivoAnulacion:r.motivoAnulacion||"", sinOrden:!!r.sinOrden})};
   })});
   /* text/plain evita el preflight CORS que Apps Script no responde */
-  await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:cuerpo, redirect:"follow"});
+  const r = await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:cuerpo, redirect:"follow"});
+  if(!r.ok) throw new Error("HTTP "+r.status+" al subir los registros");
+  DB.meta.subidaError="";
+  return true;
 }
 async function sincronizar(silencioso){
   const cx = DB.meta.conexion;
@@ -4008,6 +4720,15 @@ async function sincronizar(silencioso){
         const local = new Map(DB.registros.map(r=>[r.id, r]));
         registros.forEach(r=>{
           if(!r || !r.id) return;
+          /* La hoja guarda los campos internos dentro de "crudo". Se vuelven a
+             abrir aquí para no perder anulaciones, correcciones ni la foto
+             del componente al traer un registro hecho en otro equipo. */
+          if(typeof r.crudo==="string" && r.crudo){
+            try{ Object.assign(r, JSON.parse(r.crudo)); }catch(e){}
+          }
+          delete r.crudo;
+          if(r.cantidad==null && r.unidades!=null) r.cantidad=+r.unidades||0;
+          if(!Array.isArray(r.historial)) r.historial=[];
           /* Drive guarda la OT y el componente como texto: se recuperan aunque
              la orden ya no exista en la app. */
           if(r.ot && !r.otTexto) r.otTexto=String(r.ot);
@@ -4023,6 +4744,7 @@ async function sincronizar(silencioso){
           if(tR && tR > tL) local.set(r.id, r);           // el remoto es más nuevo
         });
         DB.registros = [...local.values()];
+        migrar();          /* reengancha por número de OT lo que llegó de la hoja */
       }
       DB.meta.conexion.remapeado = remapeado;
       DB.meta.conexion.ultimaSync = new Date().toISOString();
@@ -4375,7 +5097,7 @@ function restaurarRegistro(id){
 function modalEditarRegistro(id){
   const r = byId(DB.registros,id); if(!r) return;
   if(!puedeTocar(r)){ toast("Solo coordinación puede editar este registro"); return; }
-  const o=byId(DB.ordenes,r.ordenId), c=byId(DB.componentes,r.componenteId);
+  const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r);
   const acts=DB.actividades.slice().sort((a,b)=>a.orden-b.orden);
   const hist=r.historial||[];
   abrirModal("Corregir registro", `

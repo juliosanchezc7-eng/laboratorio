@@ -1242,12 +1242,32 @@ async function commit(fn, msg){
 
 /* ---- maestros: se guardan sin redibujar (si no, el botón se va antes del clic) ---- */
 const MAESTROS=["cuartos","tecnicos","tiposComponente","tipologias","actividades","estandares","repartos","clientes","estados","estadosCerrados","motivos","festivos","tiposNovedad","ausencias"];
+/* Las órdenes que vienen de la hoja se reconstruyen igual en cada equipo
+   (por eso los identificadores estables). Pero las que alguien crea A MANO
+   —porque el componente llegó antes de que bodega lo anotara— solo existen
+   en ese equipo. Estas sí tienen que viajar. Son pocas, así que van con la
+   configuración y se MEZCLAN por id en vez de reemplazar: así nadie borra
+   lo que agregó otro. */
 function paqueteMaestros(){
   const p={ts:DB.meta.configTs||0, horario:DB.meta.horario, pin:DB.meta.pin||""};
-  MAESTROS.forEach(k=>p[k]=DB[k]); return p;
+  MAESTROS.forEach(k=>p[k]=DB[k]);
+  p.ordenesManuales   = DB.ordenes.filter(o=>o.origen==="manual");
+  p.componentesManuales = DB.componentes.filter(c=>c.origen==="manual");
+  return p;
+}
+function mezclarPorId(lista, entrantes){
+  const hay=new Set(lista.map(x=>x.id));
+  let n=0;
+  (entrantes||[]).forEach(x=>{ if(x && x.id && !hay.has(x.id)){ lista.push(x); hay.add(x.id); n++; } });
+  return n;
 }
 function aplicarMaestros(p){
-  if(!p || !p.ts || (DB.meta.configTs||0)>=p.ts) return false;
+  if(!p) return false;
+  /* Lo creado a mano se mezcla SIEMPRE, aunque la configuración no sea más
+     nueva: son datos que se suman, nunca se pisan entre sí. */
+  let sumadas = mezclarPorId(DB.ordenes, p.ordenesManuales)
+              + mezclarPorId(DB.componentes, p.componentesManuales);
+  if(!p.ts || (DB.meta.configTs||0)>=p.ts) return sumadas>0;
   MAESTROS.forEach(k=>{ if(Array.isArray(p[k])) DB[k]=p[k]; });
   if(p.horario) DB.meta.horario=p.horario;
   if(p.pin!==undefined) DB.meta.pin=p.pin;
@@ -5488,9 +5508,10 @@ function modalOrden(id, otPrecargada){
       const datos={ot, cliente:d.querySelector("#mCli").value.trim(), fechaIngreso:d.querySelector("#mFec").value, estado:d.querySelector("#mEst").value, obs:d.querySelector("#mObs").value};
       let creada=null;
       commit(()=>{ if(o){ Object.assign(byId(DB.ordenes,o.id),datos); }
-        else { creada={id:idOrden(datos.ot,datos.cuartoDeclaradoId||"",datos.fechaIngreso||hoyISO()),...datos};
+        else { creada={id:idOrden(datos.ot,datos.cuartoDeclaradoId||"",datos.fechaIngreso||hoyISO()),...datos, origen:"manual"};
           if(byId(DB.ordenes,creada.id)) creada.id=uid("or");     /* choque improbable */
           DB.ordenes.push(creada); R.ordenId=creada.id; } }, "Orden guardada");
+      empujarConfig().catch(()=>{});          /* que la vean los demás equipos */
       cerrarModal();
       if(creada && VISTA==="registro"){ R.paso=2; R.componenteId=null; R.sel={}; R.busca="";
         setTimeout(()=>modalComponente(creada.id), 120); }
@@ -5555,6 +5576,7 @@ function modalComponente(ordenId, alCrear){
          leer la base antes de aplicar, y si no se espera, quien recibe el id
          todavía no lo encuentra. */
       await commit(()=>{ DB.componentes.push(nuevo); const o=byId(DB.ordenes,ordenId); if(o) o.revisar=null; },"Componente agregado");
+      empujarConfig().catch(()=>{});          /* que lo vean los demás equipos */
       if(alCrear) alCrear(nuevo.id);
       else { R.componenteId=nuevo.id; render(); }
     };

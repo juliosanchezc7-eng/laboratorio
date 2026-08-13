@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-13 · v26";
+const VERSION_APP = "2026-08-13 · v27";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -4947,6 +4947,7 @@ async function sincronizar(silencioso){
            agrega una fila). Se queda la más reciente, y las correcciones o
            anulaciones hechas aquí no se pierden. */
         const local = new Map(DB.registros.map(r=>[r.id, r]));
+        const aprendidas = {};
         registros.forEach(r=>{
           if(!r || !r.id) return;
           /* La hoja guarda los campos internos dentro de "crudo". Se vuelven a
@@ -4966,6 +4967,20 @@ async function sincronizar(silencioso){
           if(mio){
             if(!mio.otTexto && r.otTexto) mio.otTexto=r.otTexto;
             if(!mio.compTexto && r.compTexto) mio.compTexto=r.compTexto;
+            /* APRENDER EQUIVALENCIAS.
+               Es el mismo registro visto por dos equipos. Si el de allá apunta
+               a una orden que aquí SÍ existe, y el de acá apunta a una que no,
+               acabamos de descubrir que el número viejo y el nuevo son la misma
+               orden. Se anota y sirve para reparar todos los demás registros
+               que hayan quedado colgando del mismo número viejo. */
+            if(r.ordenId && mio.ordenId && r.ordenId!==mio.ordenId
+               && byId(DB.ordenes, r.ordenId) && !byId(DB.ordenes, mio.ordenId)){
+              aprendidas[mio.ordenId] = r.ordenId;
+            }
+            if(r.componenteId && mio.componenteId && r.componenteId!==mio.componenteId
+               && byId(DB.componentes, r.componenteId) && !byId(DB.componentes, mio.componenteId)){
+              aprendidas[mio.componenteId] = r.componenteId;
+            }
           }
           if(!mio){ local.set(r.id, r); return; }
           const tR = r.actualizado || r.anuladoEn || "";
@@ -4973,14 +4988,18 @@ async function sincronizar(silencioso){
           if(tR && tR > tL) local.set(r.id, r);           // el remoto es más nuevo
         });
         DB.registros = [...local.values()];
-        migrar();          /* reengancha por número de OT lo que llegó de la hoja */
+        if(Object.keys(aprendidas).length){
+          DB.meta.remapeoIds = Object.assign({}, DB.meta.remapeoIds||{}, aprendidas);
+          res.aprendidas = Object.keys(aprendidas).length;
+        }
+        migrar();          /* reengancha por OT y por las equivalencias aprendidas */
       }
       DB.meta.conexion.remapeado = remapeado;
       DB.meta.conexion.ultimaSync = new Date().toISOString();
       DB.meta.conexion.ultimoError = res && res.error ? res.error : "";
       DB.meta.conexion.ultimoResumen = {filas:(filas.length-1), nOT:res.nOT||0, nAct:res.nAct||0,
         nC:res.nC||0, omitidas:res.omitidas||0, sinFecha:res.sinFecha||0, multi:res.multi||0, repetidas:res.repetidas||0, adoptadas:res.adoptadas||0, reasignadas:res.reasignadas||0, corte:cx.desdeFecha||"",
-        nuevosEstados:res.nuevosEstados||[], porRevisar:res.porRevisar||0, depurados:res.depurados||0,
+        nuevosEstados:res.nuevosEstados||[], porRevisar:res.porRevisar||0, depurados:res.depurados||0, aprendidas:res.aprendidas||0,
         avisos:res.avisos||[]};
     });
     await empujarRegistros();
@@ -5246,6 +5265,7 @@ function vConexion(){
         <tr><td>Órdenes actualizadas</td><td class="num mono">${cx.ultimoResumen.nAct}</td></tr>
         <tr><td>Componentes agregados</td><td class="num mono">${cx.ultimoResumen.nC}</td></tr>
         <tr style="background:#fdefe5"><td><b>Omitidas por ser anteriores a ${cx.ultimoResumen.corte?fmtFecha(cx.ultimoResumen.corte):"el corte"}</b></td><td class="num mono"><b>${cx.ultimoResumen.omitidas}</b></td></tr>
+        ${cx.ultimoResumen.aprendidas?`<tr style="background:#eaf6ef"><td>Equivalencias aprendidas de otros equipos<br><span class="tag">registros que estaban "sin OT" y volvieron a su orden</span></td><td class="num mono">${cx.ultimoResumen.aprendidas}</td></tr>`:""}
         ${cx.ultimoResumen.reasignadas?`<tr style="background:#eaf1f8"><td>Columnas reconectadas<br><span class="tag">apuntaban a un componente que ya no existía</span></td><td class="num mono">${cx.ultimoResumen.reasignadas}</td></tr>`:""}
         ${cx.ultimoResumen.adoptadas?`<tr style="background:#eaf6ef"><td>Órdenes recuperadas de versiones anteriores<br><span class="tag">se renombraron en vez de duplicarse</span></td><td class="num mono">${cx.ultimoResumen.adoptadas}</td></tr>`:""}
         ${cx.ultimoResumen.repetidas?`<tr><td>Filas adicionales de una OT ya existente<br><span class="tag">sus cantidades se suman a la misma orden</span></td><td class="num mono">${cx.ultimoResumen.repetidas}</td></tr>`:""}

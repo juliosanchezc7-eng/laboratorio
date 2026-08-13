@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-13 · v25";
+const VERSION_APP = "2026-08-13 · v26";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -905,6 +905,10 @@ function migrar(){
     if(!r.compTexto && r.componenteId){ const c=fotoComponente(r);
       if(c){ r.compTexto=nom(DB.tiposComponente,c.tipoComponenteId,""); n++; } }
     if(!r.ordenId) return;
+    /* Equivalencias que compartieron otros equipos al renumerar. */
+    const eq=DB.meta.remapeoIds||{};
+    if(!byId(DB.ordenes,r.ordenId) && eq[r.ordenId]){ r.ordenId=eq[r.ordenId]; n++; }
+    if(r.componenteId && !byId(DB.componentes,r.componenteId) && eq[r.componenteId]){ r.componenteId=eq[r.componenteId]; n++; }
     /* Si la orden se recreó con otro id, se reengancha por el número de OT. */
     if(!byId(DB.ordenes,r.ordenId) && r.otTexto){
       const o=DB.ordenes.find(x=>x.ot===r.otTexto && (!r.cuartoId || (x.cuartoDeclaradoId||"")===r.cuartoId))
@@ -1199,6 +1203,11 @@ function migrar(){
         n++;
       }
     });
+    /* Se guarda la equivalencia viejo -> nuevo. Este equipo sabe que su
+       or_msonz3w3wymdl era la OT 4854; los demás equipos no tienen forma de
+       adivinarlo. Compartiendo el mapa, cada uno repara los registros ajenos
+       que le llegaron rotos. */
+    DB.meta.remapeoIds = Object.assign({}, DB.meta.remapeoIds||{}, mapaO, mapaC);
     DB.meta.idsEstables=true; n++;
   }
   ["cuartos","tecnicos","tiposComponente","tipologias","actividades","clientes"].forEach(k=>{
@@ -1253,6 +1262,7 @@ function paqueteMaestros(){
   MAESTROS.forEach(k=>p[k]=DB[k]);
   p.ordenesManuales   = DB.ordenes.filter(o=>o.origen==="manual");
   p.componentesManuales = DB.componentes.filter(c=>c.origen==="manual");
+  p.remapeoIds        = DB.meta.remapeoIds||{};
   return p;
 }
 function mezclarPorId(lista, entrantes){
@@ -1267,6 +1277,11 @@ function aplicarMaestros(p){
      nueva: son datos que se suman, nunca se pisan entre sí. */
   let sumadas = mezclarPorId(DB.ordenes, p.ordenesManuales)
               + mezclarPorId(DB.componentes, p.componentesManuales);
+  if(p.remapeoIds){                       /* las equivalencias se suman entre equipos */
+    const mio=DB.meta.remapeoIds||{}; let nuevas=0;
+    Object.keys(p.remapeoIds).forEach(k=>{ if(!mio[k]){ mio[k]=p.remapeoIds[k]; nuevas++; } });
+    if(nuevas){ DB.meta.remapeoIds=mio; sumadas+=nuevas; migrar(); }
+  }
   if(!p.ts || (DB.meta.configTs||0)>=p.ts) return sumadas>0;
   MAESTROS.forEach(k=>{ if(Array.isArray(p[k])) DB[k]=p[k]; });
   if(p.horario) DB.meta.horario=p.horario;
@@ -1382,7 +1397,7 @@ function vRegistro(){
   const me = YO ? byId(DB.tecnicos,YO) : null;
   if(!me) return `<div class="card"><div class="body"><div class="empty">Primero elige quién eres. Toca el botón <b>Elegir técnico</b> arriba a la derecha.</div></div></div>`;
   const paso = R.paso;
-  const head = `
+  const head = avisoVersion() + barraSync() + `
   <div class="steps">
     <div class="${paso===1?"on":(paso>1?"done":"")}"><b>1</b>Orden</div>
     <div class="${paso===2?"on":(paso>2?"done":"")}"><b>2</b>Actividades</div>
@@ -1581,6 +1596,7 @@ function hoyDelTecnico(){
 }
 
 function pRegistro(){
+  const rcv=$("#recargarYa"); if(rcv) rcv.onclick=()=>{ sessionStorage.setItem("labdiesel_recarga",VER_NUEVA); location.reload(true); };
   const $f=$("#fechaReg"); if($f) $f.onchange=e=>{R.fecha=e.target.value; render();};
   const $b=$("#buscaOT"); if($b){ $b.oninput=e=>{ R.busca=e.target.value; const p=e.target.selectionStart; render(); const n=$("#buscaOT"); n.focus(); n.setSelectionRange(p,p); }; }
   document.querySelectorAll("[data-ot]").forEach(b=>b.onclick=()=>{
@@ -1692,6 +1708,7 @@ async function guardarRegistro(){
 let MS = {lunes:""};
 function vMiSemana(){
   if(!YO) return `<div class="card"><div class="body"><div class="empty">Elige quién eres arriba a la derecha.</div></div></div>`;
+  const cabSync = avisoVersion() + barraSync();
   const lun = MS.lunes || semanaDe(hoyISO());
   const [d,h] = rangoSemana(lun);
   const rs = RA().filter(r=>r.tecnicoId===YO && r.fecha>=d && r.fecha<=h);
@@ -1707,7 +1724,7 @@ function vMiSemana(){
     a.setDate(a.getDate()+1); }
   const maxD = Math.max(1,...dias.map(x=>x.cap));
 
-  return `
+  return cabSync + `
   <div class="card"><div class="body"><div class="row" style="align-items:end">
     <label class="f" style="max-width:200px"><span>Semana del</span><input type="date" id="msLunes" value="${lun}"></label>
     <div style="flex:0 0 auto;margin-bottom:11px"><button class="btn sm" id="msPrev">← Anterior</button>
@@ -1744,6 +1761,7 @@ function vMiSemana(){
   </div></div>`;
 }
 function pMiSemana(){
+  const rc=$("#recargarYa"); if(rc) rc.onclick=()=>{ sessionStorage.setItem("labdiesel_recarga",VER_NUEVA); location.reload(true); };
   if(!YO) return;                     /* sin técnico elegido no hay controles que enganchar */
   const mv=n=>{ const l=new Date((MS.lunes||semanaDe(hoyISO()))+"T12:00:00"); l.setDate(l.getDate()+n); MS.lunes=isoLocal(l); render(); };
   $("#msLunes").onchange=e=>{ MS.lunes=semanaDe(e.target.value); render(); };
@@ -4814,7 +4832,7 @@ function exportarOrdenes(){
    Modo Script: Apps Script hace de puente (dos vías: lee órdenes, devuelve
                 registros y los comparte entre todos los dispositivos).
    ========================================================================= */
-let SYNC = {corriendo:false, timer:null};
+let SYNC = {corriendo:false, timer:null, timerVer:null};
 
 /* Lector de CSV que respeta los saltos de línea DENTRO de una celda.
    Antes se cortaba por "\n" antes de mirar las comillas: una observación
@@ -4869,7 +4887,17 @@ async function empujarRegistros(){
   if(cx.modo!=="script" || !cx.gsUrl) return;
   DB.meta.registrosSubidos = new Date().toISOString();
   DB.registros.forEach(r=>{ if(!r.actualizado) r.actualizado=r.anuladoEn||new Date().toISOString(); });
-  const cuerpo = JSON.stringify({accion:"registros", registros: DB.registros.map(r=>{
+  /* NO subir lo que este equipo no entiende.
+     Antes se subían TODOS los registros. Si aquí llegaba uno de otro técnico
+     cuya orden este equipo no conoce, se subía con la OT vacía y BORRABA en la
+     hoja el número que sí había puesto el equipo donde nació. El coordinador
+     terminaba destruyendo el dato bueno cada vez que sincronizaba.
+     Ahora, si no podemos aportar la OT ni el componente, nos callamos: el
+     registro se queda como está en la hoja. */
+  const puedoAportar = r => r.sinOrden || byId(DB.ordenes,r.ordenId) || r.otTexto || fotoComponente(r);
+  const aSubir = DB.registros.filter(puedoAportar);
+  DB.meta.registrosOmitidos = DB.registros.length - aSubir.length;
+  const cuerpo = JSON.stringify({accion:"registros", registros: aSubir.map(r=>{
     const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r), a=byId(DB.actividades,r.actividadId);
     return {id:r.id, fecha:r.fecha, semana:semanaDe(r.fecha), tecnico:nom(DB.tecnicos,r.tecnicoId),
       cuarto:nom(DB.cuartos,r.cuartoId), ot:o?o.ot:(r.otTexto||""), cliente:o?o.cliente:"",
@@ -4970,10 +4998,83 @@ async function sincronizar(silencioso){
   }
   SYNC.corriendo=false;
 }
+/* =========================================================================
+   AVISO DE VERSIÓN NUEVA
+   El navegador guarda la app en caché. Si el coordinador publica una versión
+   y el técnico no cierra del todo su navegador, sigue trabajando con la vieja
+   y genera datos que no encajan. Aquí la app se revisa a sí misma: descarga
+   su propio archivo y compara el número de versión.
+   No recarga en mitad de un registro: si hay algo a medias, avisa y espera.
+   ========================================================================= */
+let VER_NUEVA = "";
+function hayTrabajoAMedias(){
+  if(document.querySelector(".modal")) return true;
+  if(VISTA==="registro" && (R.paso>1 || R.ordenId || Object.keys(R.sel||{}).length)) return true;
+  return false;
+}
+async function revisarVersion(){
+  try{
+    const r = await fetch(location.pathname+"?_v="+Date.now(), {cache:"no-store"});
+    if(!r.ok) return;
+    const t = await r.text();
+    const m = t.match(/const VERSION_APP = "([^"]+)"/);
+    if(!m || m[1]===VERSION_APP) return;
+    VER_NUEVA = m[1];
+    /* Si ya recargamos por esta versión y seguimos viendo la vieja, es caché
+       del servidor: no insistimos en bucle, solo avisamos. */
+    const ya = sessionStorage.getItem("labdiesel_recarga");
+    if(ya!==VER_NUEVA && !hayTrabajoAMedias()){
+      sessionStorage.setItem("labdiesel_recarga", VER_NUEVA);
+      toast("Actualizando a la versión "+VER_NUEVA+"…");
+      setTimeout(()=>location.reload(true), 900);
+      return;
+    }
+    render();                       /* deja el aviso visible para que decida */
+  }catch(e){ /* sin red: se reintenta luego */ }
+}
+/* Aviso que ve el técnico: si está a medias, actualiza cuando él quiera. */
+function avisoVersion(){
+  if(!VER_NUEVA) return "";
+  return `<div class="card noprint" style="border-color:#f3ccb0;background:#fdefe5">
+    <div class="body" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b style="color:var(--signal)">Hay una versión nueva de la app (${esc(VER_NUEVA)}).</b>
+      <span class="hint" style="margin:0">Termina lo que estás registrando y actualiza.</span>
+      <button class="btn sm primary" id="recargarYa" style="margin-left:auto">Actualizar ahora</button>
+    </div></div>`;
+}
+/* =========================================================================
+   ESTADO DE SINCRONIZACIÓN VISIBLE PARA EL TÉCNICO
+   Antes, si el puente fallaba, el técnico seguía guardando sin enterarse.
+   ========================================================================= */
+function pendientesSubida(){
+  const t = DB.meta.registrosSubidos||"";
+  return DB.registros.filter(r=>(r.actualizado||"")>t).length;
+}
+function barraSync(){
+  const cx=DB.meta.conexion||{};
+  if(!cx.modo) return "";
+  const err = cx.ultimoError || DB.meta.subidaError || "";
+  const pend = pendientesSubida();
+  const cuando = cx.ultimaSync ? new Date(cx.ultimaSync) : null;
+  const mins = cuando ? Math.round((Date.now()-cuando.getTime())/60000) : null;
+  const hace = mins===null ? "nunca" : (mins<1?"hace un momento":(mins<60?`hace ${mins} min`:`hace ${Math.round(mins/60)} h`));
+  const mal = !!err || (pend>0 && mins!==null && mins>30);
+  return `<div class="card noprint" style="border-color:${mal?"#eec4c1":"#dfe3e8"}">
+    <div class="body" style="padding:9px 13px;display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:13px">
+      <span style="width:9px;height:9px;border-radius:50%;background:${mal?"var(--red)":"var(--green)"};flex:0 0 auto"></span>
+      ${mal
+        ? `<b style="color:var(--red)">No se está guardando en el servidor.</b>
+           <span class="hint" style="margin:0">Tu trabajo queda en este equipo${pend?` · ${pend} registro(s) por subir`:""}. Avísale a coordinación.</span>`
+        : `<span>Sincronizado <b>${hace}</b>${pend?` · subiendo ${pend}`:""}</span>`}
+    </div></div>`;
+}
 function programarSync(){
   clearInterval(SYNC.timer);
   const cx=DB.meta.conexion;
   if(cx.modo && cx.autoMin>0) SYNC.timer=setInterval(()=>sincronizar(true), cx.autoMin*60000);
+  clearInterval(SYNC.timerVer);
+  SYNC.timerVer=setInterval(revisarVersion, 15*60000);
+  setTimeout(revisarVersion, 20000);        /* una primera revisión al arrancar */
 }
 
 async function probarConexion(){

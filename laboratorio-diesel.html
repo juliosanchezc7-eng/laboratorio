@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-13 · v27";
+const VERSION_APP = "2026-08-13 · v30";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -595,9 +595,26 @@ function capacidadTecnicoRango(tecnicoId, desde, hasta){
   while(a<=b){ t+=capacidadTecnicoDia(tecnicoId, isoLocal(a)); a.setDate(a.getDate()+1); }
   return t;
 }
-/* Suma de la jornada realmente disponible de todo el equipo en un rango. */
-function capacidadEquipoRango(desde, hasta){
-  return DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador")
+/* Quién entra en el denominador de los indicadores.
+   No todos los técnicos producen horas de reparación: soldadura, torno y
+   mantenimiento son cuartos de apoyo y no registran órdenes. Si se cuentan,
+   arrastran la productividad hacia abajo sin que nadie haya rendido mal.
+   Regla: cuentan los de cuartos PRINCIPALES, y además cualquiera que sí haya
+   registrado algo en el periodo (si mañana soldadura empieza a registrar,
+   entra sola sin tocar configuración). */
+function tecnicosQueCuentan(desde, hasta, cuartoId, tecnicoId){
+  const principales=new Set(DB.cuartos.filter(c=>c.tipo==="principal").map(c=>c.id));
+  const conRegistro=new Set(DB.registros.filter(r=>!r.anulado && r.fecha>=desde && r.fecha<=hasta).map(r=>r.tecnicoId));
+  return DB.tecnicos.filter(t=>{
+    if(t.activo===false || t.rol==="coordinador") return false;
+    if(tecnicoId && t.id!==tecnicoId) return false;
+    if(cuartoId && t.cuartoId!==cuartoId) return false;
+    return principales.has(t.cuartoId) || conRegistro.has(t.id);
+  });
+}
+/* Jornada realmente disponible del grupo que se está mirando. */
+function capacidadEquipoRango(desde, hasta, cuartoId, tecnicoId){
+  return tecnicosQueCuentan(desde,hasta,cuartoId,tecnicoId)
     .reduce((acc,t)=>acc+capacidadTecnicoRango(t.id, desde, hasta), 0);
 }
 /* Minutos que se perdieron por ausencia en el rango (para el informe). */
@@ -1690,7 +1707,12 @@ async function guardarRegistro(){
       const ord = byId(DB.ordenes,R.ordenId); if(ord) ord.estado=ultEstado;
     }
   }, "Registro guardado ✓");
-  empujarRegistros().catch(e=>{ DB.meta.subidaError=e.message||"no se pudo subir"; });
+  empujarRegistros().catch(e=>{
+    DB.meta.subidaError=e.message||"no se pudo subir";
+    /* Un fallo de red suele ser pasajero: se reintenta una vez, sin perder nada.
+       Lo registrado ya está guardado en este equipo. */
+    setTimeout(()=>empujarRegistros().catch(()=>{}), 45000);
+  });
   if(otrosComp.length){
     /* La orden tiene más componentes: se queda en ella para seguir registrando. */
     R.componenteId=null; R.sel={}; R.novedad=""; R.tipoNovedad=""; R.estadoOrden=""; R.paso=2;
@@ -2000,10 +2022,13 @@ function vDashboard(){
   const real=rs.reduce((a,r)=>a+r.minutos,0);
   const std=rs.reduce((a,r)=>a+r.minutosStd,0);
   const efi = real? Math.round(std/real*100):0;
-  const nTec = DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador").length;
+  const cuentan = tecnicosQueCuentan(d,h,FD.cuarto,FD.tecnico);
+  const nTec = cuentan.length;
   const minNoProd = minutosNoProductivos(rs);
   const minAus = minutosAusencia(d,h);
-  const capTotal = Math.max(0, capacidadEquipoRango(d,h) - minNoProd);
+  /* El denominador tiene que ser del MISMO grupo que el numerador: si se
+     filtra por cuarto, la jornada disponible también. */
+  const capTotal = Math.max(0, capacidadEquipoRango(d,h,FD.cuarto,FD.tecnico) - minNoProd);
   const prod = capTotal? Math.round(std/capTotal*100):0;
   const undTerm = rs.filter(r=>r.actividadId==="ac_prueba_fin"||r.actividadId==="ac_empaque").reduce((a,r)=>a+r.cantidad,0);
   const otsTocadas = new Set(rs.map(r=>r.ordenId)).size;
@@ -2503,9 +2528,9 @@ function vSemanal(){
   const real=rs.reduce((a,r)=>a+r.minutos,0), std=rs.reduce((a,r)=>a+r.minutosStd,0);
   const efi=real?Math.round(std/real*100):0;
   const capDia=capacidadRango(d,h);
-  const activos=DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador");
+  const activos=tecnicosQueCuentan(d,h,FD.cuarto,FD.tecnico);
   const minNoProd=minutosNoProductivos(rs);
-  const cap=Math.max(0, capacidadEquipoRango(d,h) - minNoProd);
+  const cap=Math.max(0, capacidadEquipoRango(d,h,FD.cuarto,FD.tecnico) - minNoProd);
   const ocup=cap?Math.round(real/cap*100):0;
 
   const tec=activos.map(t=>{
@@ -4151,6 +4176,10 @@ function panelReparar(){
     </tbody></table></div>
     <button class="btn primary" id="repEnganchar">Reenganchar por número de OT</button>
     <hr class="sep">
+    <div class="eyebrow" style="margin-bottom:6px">Reparar con el respaldo de otro equipo</div>
+    <p class="hint" style="margin-top:0">Si en el computador del técnico los registros sí muestran su OT, pídele el respaldo (<b>Datos → Descargar respaldo</b>) y cárgalo aquí. La app compara los dos y reconecta los tuyos. <b>No reemplaza nada</b>: solo rellena lo que aquí falta.</p>
+    <input type="file" id="repOtro" accept=".json,application/json" style="font-size:13px">
+    <hr class="sep">
     <div class="eyebrow" style="margin-bottom:6px">Recuperar el OT desde el historial de la hoja</div>
     <p class="hint" style="margin-top:0">Si la columna <span class="mono">ot</span> de REGISTROS_APP quedó vacía, ábrela en <b>Archivo → Historial de versiones</b>, busca una versión de cuando todavía tenía los números, copia el bloque completo (con encabezados) y pégalo aquí. <b>Puedes pegar varias versiones, una tras otra</b>: solo se rellena lo que falta, nunca se pisa lo que ya está bien.</p>
     <details style="margin:0 0 9px"><summary style="cursor:pointer;font-size:13px;font-weight:600">El historial no me deja copiar bien</summary>
@@ -4181,6 +4210,32 @@ function panelReparar(){
     <p class="hint" style="margin-top:0">Registros productivos que hoy valen cero. Después de reparar lo de arriba y de completar los tiempos en Maestros, usa <b>Recalcular horas estándar</b> en Maestros → Reparto del proceso para aplicarlo hacia atrás.</p>`:""}
   </div></div>`;
 }
+/* Aprende las equivalencias comparando con el respaldo de OTRO equipo.
+   El mismo registro tiene el mismo id en los dos; si allá apunta a una orden
+   que aquí existe y la nuestra no, ya sabemos que los dos números son la
+   misma orden. No depende de la sincronización ni de esperar a nadie. */
+function aprenderDeRespaldo(txt){
+  let d; try{ d=JSON.parse(limpiarJson(txt)); }catch(e){ return {error:"Ese archivo no es un respaldo válido"}; }
+  if(!d || !Array.isArray(d.registros)) return {error:"El respaldo no trae registros"};
+  const ordAlla=new Map((d.ordenes||[]).map(o=>[o.id,o]));
+  const compAlla=new Map((d.componentes||[]).map(c=>[c.id,c]));
+  const mio=new Map(DB.registros.map(r=>[r.id,r]));
+  const eq={}; const campos=[];
+  let pareados=0;
+  d.registros.forEach(rf=>{
+    const rj=mio.get(rf.id); if(!rj) return;
+    pareados++;
+    if(rf.ordenId && rj.ordenId && rf.ordenId!==rj.ordenId
+       && byId(DB.ordenes,rf.ordenId) && !byId(DB.ordenes,rj.ordenId)) eq[rj.ordenId]=rf.ordenId;
+    if(rf.componenteId && rj.componenteId && rf.componenteId!==rj.componenteId
+       && byId(DB.componentes,rf.componenteId) && !byId(DB.componentes,rj.componenteId)) eq[rj.componenteId]=rf.componenteId;
+    /* Texto que allá sí quedó guardado y aquí no. */
+    if(rf.otTexto && !rj.otTexto) campos.push([rj.id,"otTexto",rf.otTexto]);
+    if(rf.compTexto && !rj.compTexto) campos.push([rj.id,"compTexto",rf.compTexto]);
+    if(rf.tipoComponenteId && !rj.tipoComponenteId) campos.push([rj.id,"tipoComponenteId",rf.tipoComponenteId]);
+  });
+  return {eq, campos, pareados, equipo:(d.meta&&d.meta.version)||"?", total:d.registros.length};
+}
 function pRepararRegistros(){
   const eng=$("#repEnganchar");
   if(eng) eng.onclick=async()=>{
@@ -4193,6 +4248,38 @@ function pRepararRegistros(){
       "Reenganchar")) return;
     await commit(()=>aplicarReenganche(plan), plan.length+" registros reenganchados");
     empujarRegistros().catch(()=>{});
+  };
+  const ro=$("#repOtro");
+  if(ro) ro.onchange=e=>{
+    const f=e.target.files[0]; if(!f) return;
+    const rd=new FileReader();
+    rd.onload=async()=>{
+      const res=aprenderDeRespaldo(rd.result);
+      if(res.error){ toast(res.error); return; }
+      const nEq=Object.keys(res.eq).length;
+      if(!nEq && !res.campos.length){
+        toast(`Se compararon ${res.pareados} registros, pero ese equipo no aporta nada que aquí falte`); return; }
+      if(!await confirmar("Reparar con otro equipo",
+        `Se compararon ${res.pareados} registros en común.\n\n`+
+        (nEq?`• ${nEq} equivalencias de orden/componente\n`:"")+
+        (res.campos.length?`• ${res.campos.length} datos de texto que aquí faltaban\n`:"")+
+        `\nSe reconectan los registros y se recalculan sus horas. Nada se borra.`,
+        "Reparar")) return;
+      let antes=0, despues=0;
+      await commit(()=>{
+        antes=registrosRotos().sinComponente.length;
+        DB.meta.remapeoIds=Object.assign({}, DB.meta.remapeoIds||{}, res.eq);
+        const m=new Map(DB.registros.map(r=>[r.id,r]));
+        res.campos.forEach(([id,k,v])=>{ const r=m.get(id); if(r && !r[k]) r[k]=v; });
+        migrar();
+        DB.registros.forEach(r=>{ const c=fotoComponente(r);
+          if(c) r.minutosStd=stdRegistro(c, r.actividadId, r.cantidad); });
+        despues=registrosRotos().sinComponente.length;
+      }, "Reparado");
+      toast(`Registros sin componente: ${antes} → ${despues}`);
+      empujarRegistros().catch(()=>{});
+    };
+    rd.readAsText(f);
   };
   const rec=$("#recOTgo");
   if(rec) rec.onclick=async()=>{
@@ -4882,10 +4969,12 @@ async function empujarConfig(){
   DB.meta.configSubido = new Date().toISOString();
   Store.set(KEY, DB, true);
 }
-async function empujarRegistros(){
+async function empujarRegistros(todo){
   const cx = DB.meta.conexion;
   if(cx.modo!=="script" || !cx.gsUrl) return;
-  DB.meta.registrosSubidos = new Date().toISOString();
+  /* La marca de "subido" se pone SOLO si el envío sale bien (más abajo).
+     Ponerla aquí hacía que un fallo de red se diera por bueno y el registro
+     no se volviera a intentar nunca. */
   DB.registros.forEach(r=>{ if(!r.actualizado) r.actualizado=r.anuladoEn||new Date().toISOString(); });
   /* NO subir lo que este equipo no entiende.
      Antes se subían TODOS los registros. Si aquí llegaba uno de otro técnico
@@ -4895,8 +4984,14 @@ async function empujarRegistros(){
      Ahora, si no podemos aportar la OT ni el componente, nos callamos: el
      registro se queda como está en la hoja. */
   const puedoAportar = r => r.sinOrden || byId(DB.ordenes,r.ordenId) || r.otTexto || fotoComponente(r);
-  const aSubir = DB.registros.filter(puedoAportar);
+  /* Solo lo que CAMBIÓ desde la última subida buena.
+     Antes se reenviaban los 242 registros cada 10 minutos desde cada equipo.
+     Con 20 dispositivos son miles de escrituras diarias en la hoja, y Google
+     corta el Apps Script por cuota: ahí aparece "Failed to fetch". */
+  const desde = todo ? "" : (DB.meta.registrosSubidos||"");
+  const aSubir = DB.registros.filter(r=>puedoAportar(r) && (!desde || (r.actualizado||r.creado||"")>desde));
   DB.meta.registrosOmitidos = DB.registros.length - aSubir.length;
+  if(!aSubir.length) return true;                 /* nada nuevo: no molestamos al puente */
   const cuerpo = JSON.stringify({accion:"registros", registros: aSubir.map(r=>{
     const o=byId(DB.ordenes,r.ordenId), c=fotoComponente(r), a=byId(DB.actividades,r.actividadId);
     return {id:r.id, fecha:r.fecha, semana:semanaDe(r.fecha), tecnico:nom(DB.tecnicos,r.tecnicoId),
@@ -4920,6 +5015,7 @@ async function empujarRegistros(){
   const r = await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:cuerpo, redirect:"follow"});
   if(!r.ok) throw new Error("HTTP "+r.status+" al subir los registros");
   DB.meta.subidaError="";
+  DB.meta.registrosSubidos=new Date().toISOString();
   return true;
 }
 async function sincronizar(silencioso){
@@ -5090,7 +5186,12 @@ function barraSync(){
 function programarSync(){
   clearInterval(SYNC.timer);
   const cx=DB.meta.conexion;
-  if(cx.modo && cx.autoMin>0) SYNC.timer=setInterval(()=>sincronizar(true), cx.autoMin*60000);
+  /* Separación aleatoria: si los 20 equipos sincronizan en el mismo segundo,
+     el Apps Script se satura. Cada uno arranca con un desfase propio. */
+  if(cx.modo && cx.autoMin>0){
+    const base=cx.autoMin*60000, jitter=Math.floor(Math.random()*90000);
+    SYNC.timer=setInterval(()=>sincronizar(true), base+jitter);
+  }
   clearInterval(SYNC.timerVer);
   SYNC.timerVer=setInterval(revisarVersion, 15*60000);
   setTimeout(revisarVersion, 20000);        /* una primera revisión al arrancar */

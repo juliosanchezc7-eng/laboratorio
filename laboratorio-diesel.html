@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-13 · v30";
+const VERSION_APP = "2026-08-14 · v33";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -1185,6 +1185,20 @@ function migrar(){
      "Balanceo " y "Balanceo" se veían como dos actividades distintas en los
      informes. Se recortan una sola vez. ---------------------------------- */
   if(!Array.isArray(DB.ausencias)){ DB.ausencias=[]; n++; }
+  /* --- v31: fases coherentes con la estructura acordada -------------------
+     El lavado va DENTRO de la hora de reparación (así se pactó con turbos) y
+     la prueba de toberas es parte del diagnóstico. Estaban al revés, y por eso
+     los subtotales no cuadraban con el estándar de la empresa.
+     Se corrige una sola vez; después se cambia desde Maestros → Tiempos. --- */
+  if(!DB.meta.fasesV31){
+    const arreglo={"lavado / limpieza":"Reparación","prueba inyector / toberas":"Diagnóstico",
+                   "prueba inyector / tobera":"Diagnóstico"};
+    (DB.actividades||[]).forEach(a=>{
+      const k=String(a.nombre||"").trim().toLowerCase();
+      if(arreglo[k] && a.fase!==arreglo[k]){ a.fase=arreglo[k]; n++; }
+    });
+    DB.meta.fasesV31=true; n++;
+  }
   /* --- v25: renumerar órdenes y componentes con identificadores estables ---
      Se recalcula el id de cada orden y componente a partir de su contenido y
      se arrastran las referencias de registros y componentes. A partir de aquí
@@ -1279,7 +1293,36 @@ function paqueteMaestros(){
   MAESTROS.forEach(k=>p[k]=DB[k]);
   p.ordenesManuales   = DB.ordenes.filter(o=>o.origen==="manual");
   p.componentesManuales = DB.componentes.filter(c=>c.origen==="manual");
-  p.remapeoIds        = DB.meta.remapeoIds||{};
+  /* El mapa de equivalencias crece sin techo. Se conservan las últimas 400:
+     de sobra para reparar, y no infla el paquete. */
+  const eq=DB.meta.remapeoIds||{}, claves=Object.keys(eq);
+  p.remapeoIds = claves.length>400
+    ? claves.slice(-400).reduce((o,k)=>(o[k]=eq[k],o),{}) : eq;
+  /* Google Sheets no admite más de 50.000 caracteres en una celda. Si el
+     paquete se acerca, se sueltan primero las piezas menos críticas para que
+     la configuración siga viajando en vez de fallar entera. */
+  const LIMITE=45000;
+  /* Se quitan campos vacíos, nulos y falsos: no aportan nada y ocupan la
+     mitad del paquete. "tipologiaId":null en 400 registros son 8.000 letras. */
+  const podar=o=>{
+    if(Array.isArray(o)) return o.map(podar);
+    if(o && typeof o==="object"){
+      const r={};
+      Object.keys(o).forEach(k=>{ const v=o[k];
+        if(v===null||v===undefined||v===""||v===false) return;
+        if(Array.isArray(v) && !v.length) return;
+        r[k]=podar(v); });
+      return r;
+    }
+    return o;
+  };
+  if(JSON.stringify(p).length>LIMITE){
+    ["cuartos","tecnicos","tiposComponente","tipologias","actividades","estandares","repartos","ausencias","ordenesManuales","componentesManuales"]
+      .forEach(k=>{ if(Array.isArray(p[k])) p[k]=podar(p[k]); });
+  }
+  if(JSON.stringify(p).length>LIMITE) p.remapeoIds={};
+  if(JSON.stringify(p).length>LIMITE) p.clientes=[];
+  DB.meta.tamConfig = JSON.stringify(p).length;
   return p;
 }
 function mezclarPorId(lista, entrantes){
@@ -3761,7 +3804,7 @@ function pMaestros(){
 let IMP={texto:"",filas:[],map:{},sep:"\t"};
 /* ---- Importar la tabla de tiempos de la empresa ---- */
 let IMPE={texto:"",filas:[],map:{},unidad:"min"};
-const CAMPOS_E=[["ignorar","(ignorar)"],["cuarto","Cuarto"],["componente","Tipo de componente"],["tipologia","Tipología"],["actividad","Actividad"],["tiempo","Tiempo"]];
+const CAMPOS_E=[["ignorar","(ignorar)"],["cuarto","Cuarto"],["componente","Tipo de componente"],["tipologia","Tipología"],["actividad","Actividad"],["tiempo","Tiempo"],["aparte","¿Aparte del proceso?"]];
 function aMinutos(v, unidad){
   const t=String(v||"").trim().replace(",",".");
   if(!t) return 0;
@@ -3852,9 +3895,12 @@ function importarEstandares(){
       }
       /* estándar (uno por combinación) */
       const tipId = tip? tip.id : "*";
+      /* Columna opcional: marca las alternativas que no suman al proceso
+         (montaje de cartridge en vez de armar, mantenimiento suelto). */
+      const ap = idx.aparte!==undefined && /^(s[ií]|1|x|true|aparte)$/i.test(String(f[idx.aparte]||"").trim());
       const ya = DB.estandares.find(e=>e.tipoComponenteId===tipo.id && e.tipologiaId===tipId && e.actividadId===act.id);
-      if(ya){ ya.minutos=min; cont.actualizados++; }
-      else { DB.estandares.push({id:uid("es"), tipoComponenteId:tipo.id, tipologiaId:tipId, actividadId:act.id, minutos:min}); cont.nuevos++; }
+      if(ya){ ya.minutos=min; ya.aparte=ap; cont.actualizados++; }
+      else { DB.estandares.push({id:uid("es"), tipoComponenteId:tipo.id, tipologiaId:tipId, actividadId:act.id, minutos:min, aparte:ap}); cont.nuevos++; }
     });
   }).then(()=>{
     toast(`${cont.nuevos} tiempos nuevos · ${cont.actualizados} actualizados · ${cont.componentes} componentes y ${cont.actividades} actividades creadas`);
@@ -4378,6 +4424,12 @@ function vDatos(){
     <tr><td>Modo</td><td>${hasCloud?"Compartido — todos los técnicos ven los mismos datos":"Local — este dispositivo únicamente"}</td></tr>
     <tr style="background:#eaf1f8"><td><b>Versión del programa</b></td><td class="mono"><b>${VERSION_APP}</b> · estructura ${DB.meta.version||1}</td></tr>
     <tr><td>Actividades activas</td><td class="tag">${DB.actividades.filter(a=>!a.noProductiva).map(a=>esc(a.nombre)).join(" · ")}</td></tr>
+    ${(()=>{ const t=DB.meta.tamConfig||JSON.stringify(paqueteMaestros()).length;
+      const pct=Math.round(t/50000*100);
+      return `<tr style="${pct>85?"background:#fdefe5":""}">
+        <td>Tamaño de la configuración<br><span class="tag">Google Sheets no admite más de 50.000 caracteres por celda</span></td>
+        <td class="mono">${t.toLocaleString()} / 50.000 · ${pct}%
+        ${pct>85?'<br><span class="chip c-naranja">cerca del límite</span>':'<br><span class="chip c-verde">con holgura</span>'}</td></tr>`;})()}
     <tr style="${DB.meta.conexion.modo==="script"?"":"background:#fdefe5"}">
       <td>Copia de la configuración en Drive</td>
       <td>${DB.meta.conexion.modo==="script"
@@ -4988,6 +5040,10 @@ async function empujarRegistros(todo){
      Antes se reenviaban los 242 registros cada 10 minutos desde cada equipo.
      Con 20 dispositivos son miles de escrituras diarias en la hoja, y Google
      corta el Apps Script por cuota: ahí aparece "Failed to fetch". */
+  /* Con el puente v2 cada registro se actualiza por su id, así que enviar
+     solo lo que cambió es seguro. La primera vez tras cambiar de puente se
+     manda todo, para dejar la hoja completa. */
+  if(!DB.meta.subidaCompletaV2){ todo=true; }
   const desde = todo ? "" : (DB.meta.registrosSubidos||"");
   const aSubir = DB.registros.filter(r=>puedoAportar(r) && (!desde || (r.actualizado||r.creado||"")>desde));
   DB.meta.registrosOmitidos = DB.registros.length - aSubir.length;
@@ -5016,6 +5072,7 @@ async function empujarRegistros(todo){
   if(!r.ok) throw new Error("HTTP "+r.status+" al subir los registros");
   DB.meta.subidaError="";
   DB.meta.registrosSubidos=new Date().toISOString();
+  DB.meta.subidaCompletaV2=true;
   return true;
 }
 async function sincronizar(silencioso){

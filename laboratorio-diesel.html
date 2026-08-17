@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-14 · v33";
+const VERSION_APP = "2026-08-17 · v48";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -778,6 +778,10 @@ function cuartoPorNombre(nombre){
   const c=DB.cuartos.find(x=>sinTildes(x.nombre)===t)
        || DB.cuartos.find(x=>t.indexOf(sinTildes(x.nombre))>=0 || sinTildes(x.nombre).indexOf(t)>=0);
   if(c) return c.id;
+  /* Si el coordinador borró ese cuarto, la hoja no debe resucitarlo en cada
+     sincronización. "Taller" volvía una y otra vez por esto. */
+  const ignorados=(DB.meta.cuartosIgnorados||[]).map(x=>sinTildes(x));
+  if(ignorados.indexOf(t)>=0) return "";
   const nuevo={id:uid("cu"),nombre:String(nombre).trim(),tipo:"principal",grupo:""};
   DB.cuartos.push(nuevo); return nuevo.id;
 }
@@ -785,6 +789,56 @@ function cuartoPorNombre(nombre){
    1. Que pertenezca al cuarto declarado en la OT  (BOMBAS -> PLD si dice Unitario)
    2. Que alguna tipología de la celda TIPO le calce
    3. El que estaba mapeado en la columna                                        */
+/* =========================================================================
+   REGLAS DE DESGLOSE
+   La hoja de bodega tiene UNA columna para bombas, pero al laboratorio no
+   siempre llega una sola clase. En el sistema B7 una cantidad de 3 casi
+   siempre son 2 bombas B7 + 1 de transferencia (verificado en 11 órdenes;
+   nunca aparecen 4 ni 5, y las observaciones de almacén lo confirman).
+   La app aplica esa lectura, pero MARCA LA ORDEN PARA REVISAR: si algún día
+   llegan 3 bombas B7 de verdad, coordinación lo corrige desde la orden.
+   Es una costumbre del taller, no una verdad del componente: por eso se
+   avisa en vez de darlo por hecho.
+   ========================================================================= */
+const DESGLOSES = [
+  /* En un motor B7 la columna BOMBAS nunca trae bombas de alta presión.
+     Son bombas B7, y cuando la cantidad es 3 una de ellas es la de
+     transferencia (verificado en 11 órdenes: nunca aparecen 4 ni 5, y las
+     observaciones de almacén lo confirman: "BOMB TRANSF OK Y REGULADOR B7").
+     Las de alta presión quedan para ISB, CP3, CP4, HP3, Denso y las demás. */
+  { cuarto:"Electrónico", desde:"Bomba de alta presión CR", palabra:/\bb7\b/i,
+    partir: function(n){
+      return n===3
+        ? [{nombre:"Bomba B7", cant:2}, {nombre:"Transferencia", cant:1}]
+        : [{nombre:"Bomba B7", cant:n}];
+    },
+    nota: function(n){
+      return n===3
+        ? "3 bombas en un motor B7: se leyeron como 2 bombas B7 + 1 de transferencia. Verifica."
+        : n+" bomba(s) en un motor B7: se leyeron como bombas B7, no de alta presión.";
+    } }
+];
+/* Devuelve las partes en que se abre un componente, o null si no aplica. */
+function desglosarComponente(tipo, cantidad, tipoTexto, cuartoOT){
+  const nomCuarto = nom(DB.cuartos, cuartoOT, "");
+  const n = +cantidad || 0;
+  if(!n) return null;
+  for(const d of DESGLOSES){
+    if(d.cuarto!==nomCuarto) continue;
+    if(nom(DB.tiposComponente,tipo.id,"")!==d.desde) continue;
+    if(!d.palabra.test(String(tipoTexto||""))) continue;
+    const partes=[];
+    for(const p of d.partir(n)){
+      if(!p.cant) continue;
+      const t=DB.tiposComponente.find(x=>sinTildes(x.nombre)===sinTildes(p.nombre));
+      if(!t) return null;                    /* falta ese tipo: mejor no partir */
+      partes.push({tipo:t, cant:p.cant});
+    }
+    if(!partes.length) return null;
+    return {partes, nota:d.nota(n)};
+  }
+  return null;
+}
 function resolverTipo(tipoBase, tokens, usados, cuartoOT){
   const fam=familiaDe(tipoBase.nombre);
   const familia=[tipoBase].concat(DB.tiposComponente.filter(t=>t.id!==tipoBase.id && familiaDe(t.nombre)===fam));
@@ -831,18 +885,17 @@ function resolverTipo(tipoBase, tokens, usados, cuartoOT){
       }
     }
   }
-  /* Nada calzó. Si algún texto apunta a un componente que existe pero está
-     configurado en OTRA sala, se avisa: es un error de configuración. */
+  /* Ninguna tipología del cuarto calzó. Antes se devolvía SIN tipología y el
+     componente quedaba como "Sin tipología" aunque el TIPO lo dijera claro:
+     ATEGO K16 en Turbos se perdía porque esa tipología estaba sugerida en
+     Electrónico. El cuarto SUGIERE el componente, pero no debe borrar el
+     nombre del motor. Se acepta cualquier tipología que calce por nombre. */
   for(const tk of tokens){
     if(usados.has(tk)) continue;
-    const tp=DB.tipologias.find(x=>x.tipoComponenteId && coincideTipologia(x,tk));
-    if(tp){
-      const otro=byId(DB.tiposComponente,tp.tipoComponenteId);
-      if(otro && familiaDe(otro.nombre)===fam && cuartoOT && otro.cuartoId!==cuartoOT)
-        return {tipo:pref[0]||tipoBase, tip:null, token:null,
-                aviso:`"${tk}" apunta a ${otro.nombre}, que está configurado en ${nom(DB.cuartos,otro.cuartoId)} y no en ${nom(DB.cuartos,cuartoOT)}`};
-    }
+    const tp=DB.tipologias.find(x=>coincideTipologia(x,tk));
+    if(tp) return {tipo:pref[0]||tipoBase, tip:tp, token:tk};
   }
+  /* Ni siquiera existe como tipología: se deja el componente del cuarto. */
   return {tipo:pref[0]||tipoBase, tip:null, token:null};
 }
 /* Tus OT vienen como "36059-Unitario": el número es el mismo trabajo y el
@@ -1185,6 +1238,26 @@ function migrar(){
      "Balanceo " y "Balanceo" se veían como dos actividades distintas en los
      informes. Se recortan una sola vez. ---------------------------------- */
   if(!Array.isArray(DB.ausencias)){ DB.ausencias=[]; n++; }
+  /* --- Tipologías que apuntan a la nada -----------------------------------
+     Al fusionar o borrar tipologías, los componentes quedaron apuntando a un
+     identificador que ya no existe y se mostraban como "Sin tipología". Se
+     vuelve a buscar por el nombre que trae el TIPO de la orden. --------- */
+  {
+    const vivas=new Set((DB.tipologias||[]).map(t=>t.id));
+    (DB.componentes||[]).forEach(c=>{
+      if(c.tipologiaId && vivas.has(c.tipologiaId)) return;
+      const o=byId(DB.ordenes,c.ordenId);
+      if(!o || !o.tipoTexto){ if(c.tipologiaId){ c.tipologiaId=null; n++; } return; }
+      let hallada=null;
+      String(o.tipoTexto).split(/[\/;|,]+/).map(x=>x.trim()).filter(Boolean).forEach(tk=>{
+        if(hallada) return;
+        const tp=(DB.tipologias||[]).find(x=>coincideTipologia(x,tk));
+        if(tp) hallada=tp;
+      });
+      if(hallada){ c.tipologiaId=hallada.id; n++; }
+      else if(c.tipologiaId){ c.tipologiaId=null; n++; }
+    });
+  }
   /* --- v31: fases coherentes con la estructura acordada -------------------
      El lavado va DENTRO de la hora de reparación (así se pactó con turbos) y
      la prueba de toberas es parte del diagnóstico. Estaban al revés, y por eso
@@ -1298,10 +1371,10 @@ function paqueteMaestros(){
   const eq=DB.meta.remapeoIds||{}, claves=Object.keys(eq);
   p.remapeoIds = claves.length>400
     ? claves.slice(-400).reduce((o,k)=>(o[k]=eq[k],o),{}) : eq;
-  /* Google Sheets no admite más de 50.000 caracteres en una celda. Si el
-     paquete se acerca, se sueltan primero las piezas menos críticas para que
-     la configuración siga viajando en vez de fallar entera. */
-  const LIMITE=45000;
+  /* El puente v2 reparte la configuración en 10 celdas de 40.000, así que el
+     tope real es 400.000. Si aun así se acercara, se sueltan primero las
+     piezas menos críticas para que la configuración siga viajando. */
+  const LIMITE=48000;   /* margen para el puente v1; el v2 admite 400.000 */
   /* Se quitan campos vacíos, nulos y falsos: no aportan nada y ocupan la
      mitad del paquete. "tipologiaId":null en 400 registros son 8.000 letras. */
   const podar=o=>{
@@ -1353,6 +1426,13 @@ async function commitMaestro(fn, msg, quieto){
   const remoto = await Store.get(KEY, true);
   if(remoto && remoto.meta){ DB = remoto; migrar(); }
   fn();
+  /* Un cuarto que vuelve a existir deja de estar ignorado. */
+  if(Array.isArray(DB.meta.cuartosIgnorados))
+    DB.meta.cuartosIgnorados = DB.meta.cuartosIgnorados.filter(nm=>
+      !DB.cuartos.some(c=>sinTildes(c.nombre)===sinTildes(nm)));
+  /* Los avisos son una foto de la última sincronización: al cambiar un
+     maestro dejan de ser ciertos y se limpian para no confundir. */
+  if(DB.meta.conexion && DB.meta.conexion.ultimoResumen) DB.meta.conexion.ultimoResumen.avisos=[];
   DB.meta.configTs = Date.now();
   await guardar();
   empujarConfig().catch(()=>{});
@@ -2247,7 +2327,9 @@ function rangoIngresos(){
 }
 function vIngresos(){
   const [d,h]=rangoIngresos();
-  let ords=DB.ordenes.filter(o=>o.fechaIngreso>=d && o.fechaIngreso<=h);
+  /* Esta pantalla es un espejo de NUEVA PROGRAMACIÓN: solo las órdenes que
+     la hoja sigue trayendo. Lo que cambió de cuarto o de fecha ya no cuenta. */
+  let ords=DB.ordenes.filter(o=>o.vigente!==false && o.fechaIngreso>=d && o.fechaIngreso<=h);
   if(FI.cuarto) ords=ords.filter(o=>cuartosDeOrden(o).has(FI.cuarto));
   const ids=new Set(ords.map(o=>o.id));
   let comps=DB.componentes.filter(c=>ids.has(c.ordenId));
@@ -2281,11 +2363,16 @@ function vIngresos(){
 
   /* MODO HISTÓRICO: meses sin registros de técnicos. La única fuente es la hoja:
      órdenes que quedaron en estado Entregado y los componentes que traían. */
-  const modoEnt = FI.modoEntrega || (Object.keys(porComp).length? "registro" : "estado");
+  /* Ingresos NO usa los registros de los técnicos: esa lectura vive en el
+     Dashboard. Aquí manda siempre la hoja, para que el número se pueda
+     contrastar con NUEVA PROGRAMACIÓN sin sorpresas. */
+  const modoEnt = "estado";
   if(modoEnt==="estado"){
     const porIngreso = FI.baseEntrega==="ingreso";
+    const SALIDAS=/entregad|dado de baja|no autorizado/i;
     const entregadasOrd = DB.ordenes.filter(o=>{
-      if(!/entregad/i.test(o.estado||"")) return false;
+      if(o.vigente===false) return false;
+      if(!SALIDAS.test(o.estado||"")) return false;
       const ref = porIngreso ? o.fechaIngreso : (o.fechaEntrega || o.fechaIngreso);
       if(ref<d || ref>h) return false;
       if(FI.cuarto && !cuartosDeOrden(o).has(FI.cuarto)) return false;
@@ -2317,7 +2404,10 @@ function vIngresos(){
 
   const gar=ords.filter(o=>/garant/i.test(o.motivo||"")).length;
   const pendRep=ords.filter(o=>/repuesto/i.test(o.estado||"")).length;
-  const pendAut=ords.filter(o=>/autoriza/i.test(o.estado||"")).length;
+  /* "No autorizado" también contiene la palabra "autoriza": contarlo como
+     pendiente de autorización inflaba la cifra y mezclaba una orden cerrada
+     con las que siguen esperando al cliente. */
+  const pendAut=ords.filter(o=>/autoriza/i.test(o.estado||"") && !/^no\s+autoriz/i.test((o.estado||"").trim())).length;
   const entregadas=ords.filter(o=>cerr.has(o.estado)).length;
 
   const barras=(lista,total,clase)=>{ const max=Math.max(1,...lista.map(x=>x[1]));
@@ -2389,12 +2479,48 @@ function vIngresos(){
     <div class="kpi"><div class="l">Aún abiertas</div><div class="v">${ords.length-entregadas}</div><div class="h">en el laboratorio</div></div>
   </div>
 
+  <div class="card" style="border-color:#bcd0e2"><header><h2>Lo que INGRESÓ · componentes recibidos</h2>
+    <span class="sub mono">${und} unidades</span>
+    <div class="push"><button class="btn sm" id="csvIng">Exportar CSV</button></div></header>
+    <div class="body">
+    ${(()=>{
+      const porTipo={};
+      comps.forEach(c=>{ const k=nom(DB.tiposComponente,c.tipoComponenteId); porTipo[k]=(porTipo[k]||0)+(+c.cantidad||0); });
+      const lista=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
+      if(!lista.length) return "";
+      const mx=Math.max(1,...lista.map(x=>x[1]));
+      return `<div class="eyebrow" style="margin:0 0 8px">Total INGRESADO por componente · ${und} unidades</div>
+      <div class="bars" style="margin-bottom:16px">${lista.map(([k,v])=>`<div class="bar">
+        <div class="t">${esc(k)}</div><div class="track"><i style="width:${v/mx*100}%"></i></div>
+        <div class="n">${v} und · ${Math.round(v/und*100)}%</div></div>`).join("")}</div>
+      <div class="eyebrow" style="margin:0 0 4px">Detalle por cuarto y tipología</div>`;})()}
+    ${Object.keys(matriz).length?Object.entries(matriz).map(([cu,tipos])=>`
+      <div class="eyebrow" style="margin:14px 0 6px">${esc(cu)}</div>
+      <div class="tw"><table><thead><tr><th>Componente</th><th>Tipología</th><th class="num">Unidades</th></tr></thead><tbody>
+      ${Object.entries(tipos).map(([tc,tps])=>Object.entries(tps).sort((a,b)=>b[1]-a[1])
+        .map(([tp,q],i)=>`<tr><td>${i===0?`<b>${esc(tc)}</b>`:""}</td><td>${esc(tp)}</td><td class="num mono">${q}</td></tr>`).join("")).join("")}
+      </tbody></table></div>`).join(""):`<div class="empty">Sin componentes en el rango.</div>`}
+    </div></div>
+
+  ${(()=>{ const SAL=/entregad|dado de baja|no autorizado/i;
+    const g={};
+    DB.ordenes.forEach(o=>{
+      if(o.vigente===false || !SAL.test(o.estado||"")) return;
+      const ref = FI.baseEntrega==="ingreso" ? o.fechaIngreso : (o.fechaEntrega||o.fechaIngreso);
+      if(ref<d || ref>h) return;
+      if(FI.cuarto && !cuartosDeOrden(o).has(FI.cuarto)) return;
+      const k=(o.estado||"").trim(); g[k]=(g[k]||0)+1;
+    });
+    const e=Object.entries(g); if(!e.length) return "";
+    return `<div class="card"><header><h2>Cómo salieron</h2><span class="sub mono">${e.reduce((a,x)=>a+x[1],0)} órdenes</span></header>
+    <div class="body"><p class="hint" style="margin-top:0">Las tres salen del laboratorio, pero significan cosas distintas para el cliente.</p>
+    <div class="tw"><table><thead><tr><th>Estado</th><th class="num">Órdenes</th></tr></thead><tbody>
+    ${e.sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="num mono">${v}</td></tr>`).join("")}
+    </tbody></table></div></div></div>`;})()}
+
   <div class="card" style="border-color:#b6ddc6"><header><h2>Lo que SALIÓ · entregas del período</h2>
     <span class="sub mono">${undEnt} unidades</span>
-    <div class="push"><div class="seg">
-      <button data-modoent="registro" class="${modoEnt==="registro"?"on":""}">Por registro del técnico</button>
-      <button data-modoent="estado" class="${modoEnt==="estado"?"on":""}">Por estado de la hoja</button>
-    </div></div></header>
+    <span class="sub tag">según NUEVA PROGRAMACIÓN</span></header>
     <div class="body">
       ${modoEnt==="estado"
         ? `<div class="seg" style="margin-bottom:10px">
@@ -2423,10 +2549,19 @@ function vIngresos(){
           <div class="t">${esc(k)}</div><div class="track"><i style="width:${v/mx*100}%"></i></div>
           <div class="n">${v} und · ${Math.round(v/undEnt*100)}%</div></div>`).join("")}</div>
         <div class="eyebrow" style="margin:0 0 8px">Detalle por tipología</div>`;})()}
-      ${Object.keys(entMatriz).length?`<div class="tw"><table><thead><tr><th>Cuarto</th><th>Componente</th><th>Tipología</th><th class="num">Entregadas</th></tr></thead><tbody>
-      ${Object.entries(entMatriz).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{const [tc,tp,cu]=k.split("|");
-        return `<tr><td>${esc(cu)}</td><td>${esc(tc)}</td><td>${esc(tp)}</td><td class="num mono">${v}</td></tr>`;}).join("")}
-      </tbody></table></div>`
+      ${Object.keys(entMatriz).length?(()=>{
+        /* El componente se nombra una vez y debajo van sus tipologías. */
+        const m={};
+        Object.entries(entMatriz).forEach(([k,v])=>{ const [tc,tp,cu]=k.split("|");
+          m[cu]=m[cu]||{}; m[cu][tc]=m[cu][tc]||{}; m[cu][tc][tp]=(m[cu][tc][tp]||0)+v; });
+        const suma=o=>Object.values(o).reduce((x,y)=>x+y,0);
+        return Object.entries(m).map(([cu,tipos])=>`
+          <div class="eyebrow" style="margin:14px 0 6px">${esc(cu)}</div>
+          <div class="tw"><table><thead><tr><th>Componente</th><th>Tipología</th><th class="num">Entregadas</th></tr></thead><tbody>
+          ${Object.entries(tipos).sort((a,b)=>suma(b[1])-suma(a[1]))
+            .map(([tc,tps])=>Object.entries(tps).sort((a,b)=>b[1]-a[1])
+              .map(([tp,q],i)=>`<tr><td>${i===0?`<b>${esc(tc)}</b>`:""}</td><td>${esc(tp)}</td><td class="num mono">${q}</td></tr>`).join("")).join("")}
+          </tbody></table></div>`).join("");})()
       :`<div class="empty">${modoEnt==="estado"
           ? "Ninguna orden del rango quedó en estado Entregado."
           : "Todavía no hay entregas registradas en este rango.<br><br>Se contarán cuando los técnicos marquen <b>Alistamiento y entrega</b> con las unidades que salieron.<br>Para meses anteriores, cambia a <b>Por estado de la hoja</b>."}</div>`}
@@ -2508,29 +2643,7 @@ function vIngresos(){
           <td>${chipEstado(o.estado)}</td></tr>`;}).join("")}
       </tbody></table></div>
       </div></div>`;})()}
-
-  <div class="card" style="border-color:#bcd0e2"><header><h2>Lo que INGRESÓ · componentes recibidos</h2>
-    <span class="sub mono">${und} unidades</span>
-    <div class="push"><button class="btn sm" id="csvIng">Exportar CSV</button></div></header>
-    <div class="body">
-    ${(()=>{
-      const porTipo={};
-      comps.forEach(c=>{ const k=nom(DB.tiposComponente,c.tipoComponenteId); porTipo[k]=(porTipo[k]||0)+(+c.cantidad||0); });
-      const lista=Object.entries(porTipo).sort((a,b)=>b[1]-a[1]);
-      if(!lista.length) return "";
-      const mx=Math.max(1,...lista.map(x=>x[1]));
-      return `<div class="eyebrow" style="margin:0 0 8px">Total INGRESADO por componente · ${und} unidades</div>
-      <div class="bars" style="margin-bottom:16px">${lista.map(([k,v])=>`<div class="bar">
-        <div class="t">${esc(k)}</div><div class="track"><i style="width:${v/mx*100}%"></i></div>
-        <div class="n">${v} und · ${Math.round(v/und*100)}%</div></div>`).join("")}</div>
-      <div class="eyebrow" style="margin:0 0 4px">Detalle por cuarto y tipología</div>`;})()}
-    ${Object.keys(matriz).length?Object.entries(matriz).map(([cu,tipos])=>`
-      <div class="eyebrow" style="margin:14px 0 6px">${esc(cu)}</div>
-      <div class="tw"><table><thead><tr><th>Componente</th><th>Tipología</th><th class="num">Unidades</th></tr></thead><tbody>
-      ${Object.entries(tipos).map(([tc,tps])=>Object.entries(tps).sort((a,b)=>b[1]-a[1])
-        .map(([tp,q],i)=>`<tr><td>${i===0?`<b>${esc(tc)}</b>`:""}</td><td>${esc(tp)}</td><td class="num mono">${q}</td></tr>`).join("")).join("")}
-      </tbody></table></div>`).join(""):`<div class="empty">Sin componentes en el rango.</div>`}
-    </div></div>`;
+`;
 }
 function pIngresos(){
   $("#id1").onchange=e=>{FI.desde=e.target.value;render();};
@@ -2717,7 +2830,7 @@ function mTipologias(){
   <div class="body"><div class="row">${selCuarto("fCuarto",MFILTRO.cuarto)}
     <label class="f" style="max-width:280px"><span>Tipo de componente</span><select id="fTipo">
       <option value="">Todos</option>${tiposVis.map(t=>`<option value="${t.id}" ${MFILTRO.tipo===t.id?"selected":""}>${esc(t.nombre)}</option>`).join("")}</select></label></div>
-  <p class="scroll-hint">Desliza la tabla a los lados para ver todas las columnas.</p><div class="tw"><table class="acc"><thead><tr><th>Nombre</th><th>También se escribe</th><th>Sugerida en el cuarto</th><th>Sugerida para el componente</th><th>Dónde aparecerá arriba</th><th class="num">Uso</th><th>Acciones</th></tr></thead><tbody>
+  <p class="scroll-hint">Desliza la tabla a los lados para ver todas las columnas.</p><div class="tw"><table class="acc"><thead><tr><th>Nombre</th><th>También se escribe</th><th>Sugerida en el cuarto</th><th>Sugerida para el componente</th><th>Alcance</th><th class="num">Uso</th><th>Acciones</th></tr></thead><tbody>
   ${lista.map(t=>`<tr><td><input type="text" data-fld="tipologias.${t.id}.nombre" value="${esc(t.nombre)}"></td>
   <td><input type="text" data-fld="tipologias.${t.id}.alias" value="${esc(t.alias||"")}" placeholder="otras formas, separadas por coma"></td>
   <td><select data-fld="tipologias.${t.id}.cuartoId"><option value="">— cualquier cuarto —</option>
@@ -2725,12 +2838,13 @@ function mTipologias(){
   <td><select data-fld="tipologias.${t.id}.tipoComponenteId"><option value="">— cualquier componente —</option>
     ${DB.tiposComponente.map(c=>`<option value="${c.id}" ${t.tipoComponenteId===c.id?"selected":""}>${esc(c.nombre)}</option>`).join("")}</select></td>
   <td class="tag">${(()=>{
+      /* Un chip corto en vez de repetir la lista completa de componentes en
+         cada una de las 58 filas: era imposible de leer. */
       const cu=t.cuartoId?nom(DB.cuartos,t.cuartoId):"", tc=t.tipoComponenteId?nom(DB.tiposComponente,t.tipoComponenteId):"";
-      if(tc && cu) return `Solo en <b>${esc(tc)}</b> de ${esc(cu)}`;
-      if(tc) return `Solo en <b>${esc(tc)}</b>`;
-      if(cu){ const q=DB.tiposComponente.filter(x=>x.cuartoId===t.cuartoId);
-        return `Todos los componentes de <b>${esc(cu)}</b><br><span style="opacity:.7">${q.map(x=>esc(x.nombre)).join(", ")||"—"}</span>`; }
-      return `En <b>todo el laboratorio</b>`;
+      if(tc && cu) return `<span class="chip c-azul">${esc(tc)} · ${esc(cu)}</span>`;
+      if(tc) return `<span class="chip c-azul">solo ${esc(tc)}</span>`;
+      if(cu) return `<span class="chip">${esc(cu)}</span>`;
+      return `<span class="chip c-verde">todo el laboratorio</span>`;
     })()}</td>
   <td class="num mono">${DB.componentes.filter(c=>c.tipologiaId===t.id).length}</td>
   <td><button class="btn sm" data-fusion="${t.id}">Fusionar</button>
@@ -3767,7 +3881,18 @@ function pMaestros(){
       const ok = await confirmar("Eliminar", msg, usos?"Eliminar de todos modos":"Eliminar");
       if(!ok) return;
     }
-    commitMaestro(()=>{ DB[col]=DB[col].filter(x=>x.id!==id); }, "Eliminado: "+nombre);
+    commitMaestro(()=>{
+      /* Si es un cuarto, se apunta el nombre para que la hoja no vuelva a
+         crearlo en la siguiente sincronización. Se puede volver a agregar a
+         mano y entonces sale de la lista de ignorados. */
+      if(col==="cuartos"){
+        DB.meta.cuartosIgnorados = [...new Set((DB.meta.cuartosIgnorados||[]).concat([nombre]))];
+      }
+      DB[col]=DB[col].filter(x=>x.id!==id);
+      /* Los avisos guardados de la última sincronización dejan de ser válidos
+         en cuanto se toca un maestro. */
+      if(DB.meta.conexion && DB.meta.conexion.ultimoResumen) DB.meta.conexion.ultimoResumen.avisos=[];
+    }, "Eliminado: "+nombre);
   });
 
   document.querySelectorAll("[data-add]").forEach(b=>b.onclick=()=>{
@@ -4193,6 +4318,53 @@ function aplicarReenganche(plan){
     r.actualizado=new Date().toISOString();
   });
 }
+/* Componentes que alguien agregó a mano y que la hoja ya trae por su cuenta.
+   La sincronización nunca los borra —fue una decisión humana— pero si la hoja
+   ya aporta ese mismo componente, quedan duplicados e inflan los ingresos. */
+function manualesSobrantes(){
+  const conReg=new Set(DB.registros.filter(r=>!r.anulado).map(r=>r.componenteId));
+  return DB.componentes.filter(c=>{
+    if(c.origen!=="manual") return false;
+    if(conReg.has(c.id)) return false;                 /* tiene horas: no se toca */
+    const o=byId(DB.ordenes,c.ordenId);
+    if(!o || o.origen==="manual") return false;        /* la orden también es a mano */
+    /* ¿la hoja ya trae ese mismo tipo de componente en esta orden? */
+    return DB.componentes.some(x=>x.ordenId===c.ordenId && x.id!==c.id
+      && x.tipoComponenteId===c.tipoComponenteId && x.origen!=="manual");
+  });
+}
+function panelManuales(){
+  const l=manualesSobrantes();
+  if(!l.length) return "";
+  const und=l.reduce((a,c)=>a+(+c.cantidad||0),0);
+  return `<div class="card" style="border-color:#f3ccb0">
+  <header><h2>Componentes agregados a mano que duplican la hoja</h2>
+    <span class="sub mono">${l.length} · ${und} unidades</span></header>
+  <div class="body">
+    <p class="hint" style="margin-top:0">La sincronización nunca borra lo que alguien agregó a mano. Pero si NUEVA PROGRAMACIÓN ya trae ese mismo componente en la orden, queda duplicado y los ingresos cuentan de más. Ninguno de estos tiene horas registradas.</p>
+    <div class="tw" style="max-height:260px;overflow:auto"><table><thead><tr><th>OT</th><th>Componente</th><th>Tipología</th><th class="num">Und</th><th>Cuarto</th></tr></thead><tbody>
+    ${l.slice(0,40).map(c=>{const o=byId(DB.ordenes,c.ordenId);
+      return `<tr><td class="mono">${esc(o?o.ot:"—")}</td><td>${esc(nom(DB.tiposComponente,c.tipoComponenteId))}</td>
+      <td>${esc(nom(DB.tipologias,c.tipologiaId,"—"))}</td><td class="num">${c.cantidad}</td>
+      <td>${esc(nom(DB.cuartos,c.cuartoId))}</td></tr>`;}).join("")}
+    ${l.length>40?`<tr><td colspan="5" class="tag">…y ${l.length-40} más</td></tr>`:""}
+    </tbody></table></div>
+    <button class="btn danger" id="limpManuales" style="margin-top:10px">Quitar los ${l.length} duplicados</button>
+  </div></div>`;
+}
+function pManuales(){
+  const b=$("#limpManuales"); if(!b) return;
+  b.onclick=async()=>{
+    const l=manualesSobrantes();
+    if(!await confirmar("Quitar duplicados",
+      `Se van a quitar ${l.length} componentes agregados a mano que la hoja ya trae.\n\n`+
+      `Ninguno tiene horas registradas. Los ingresos volverán a cuadrar con NUEVA PROGRAMACIÓN.`,
+      "Quitar")) return;
+    const ids=new Set(l.map(c=>c.id));
+    await commit(()=>{ DB.componentes=DB.componentes.filter(c=>!ids.has(c.id)); },
+      l.length+" duplicados quitados");
+  };
+}
 function panelReparar(){
   const rot=registrosRotos();
   const nSC=rot.sinComponente.length, nSA=rot.sinActividad.length, nSE=rot.sinEstandar.length;
@@ -4225,6 +4397,10 @@ function panelReparar(){
     <div class="eyebrow" style="margin-bottom:6px">Reparar con el respaldo de otro equipo</div>
     <p class="hint" style="margin-top:0">Si en el computador del técnico los registros sí muestran su OT, pídele el respaldo (<b>Datos → Descargar respaldo</b>) y cárgalo aquí. La app compara los dos y reconecta los tuyos. <b>No reemplaza nada</b>: solo rellena lo que aquí falta.</p>
     <input type="file" id="repOtro" accept=".json,application/json" style="font-size:13px">
+    <hr class="sep">
+    <div class="eyebrow" style="margin-bottom:6px">Los registros no llegan a la hoja</div>
+    <p class="hint" style="margin-top:0">La app solo sube lo que cambió desde la última subida. Si algo se quedó atrás —por ejemplo mientras el puente estuvo caído— este botón lo vuelve a enviar todo.</p>
+    <button class="btn primary" id="reenviarTodo">Reenviar todos los registros a la hoja</button>
     <hr class="sep">
     <div class="eyebrow" style="margin-bottom:6px">Recuperar el OT desde el historial de la hoja</div>
     <p class="hint" style="margin-top:0">Si la columna <span class="mono">ot</span> de REGISTROS_APP quedó vacía, ábrela en <b>Archivo → Historial de versiones</b>, busca una versión de cuando todavía tenía los números, copia el bloque completo (con encabezados) y pégalo aquí. <b>Puedes pegar varias versiones, una tras otra</b>: solo se rellena lo que falta, nunca se pisa lo que ya está bien.</p>
@@ -4283,6 +4459,7 @@ function aprenderDeRespaldo(txt){
   return {eq, campos, pareados, equipo:(d.meta&&d.meta.version)||"?", total:d.registros.length};
 }
 function pRepararRegistros(){
+  pManuales();
   const eng=$("#repEnganchar");
   if(eng) eng.onclick=async()=>{
     const sueltos=registrosRotos().sinComponente.filter(r=>r.otTexto);
@@ -4326,6 +4503,15 @@ function pRepararRegistros(){
       empujarRegistros().catch(()=>{});
     };
     rd.readAsText(f);
+  };
+  const rs=$("#reenviarTodo");
+  if(rs) rs.onclick=async()=>{
+    if(!await confirmar("Reenviar todos los registros",
+      "Se vuelven a subir los "+RA().length+" registros de este equipo a la hoja.\n\nNo se borra nada: los que ya estén se actualizan.",
+      "Reenviar")) return;
+    try{ await empujarRegistros(true); toast("Registros reenviados"); }
+    catch(e){ toast("No se pudo: "+e.message); }
+    render();
   };
   const rec=$("#recOTgo");
   if(rec) rec.onclick=async()=>{
@@ -4398,6 +4584,8 @@ function vDatos(){
 
   ${panelChequeos()}
 
+  ${panelManuales()}
+
   ${panelReparar()}
 
   ${vImportEstandares()}
@@ -4420,15 +4608,31 @@ function vDatos(){
   </div></div>
   <p class="hint" style="margin-top:9px">El CSV abre directo en Sheets o Excel si quieres hacer tablas dinámicas propias.</p></div></div>
 
+  ${(!DB.meta.conexion || DB.meta.conexion.modo!=="script") ? `<div class="card" style="border-color:#eec4c1;background:#fdf0ef">
+    <div class="body"><b style="color:var(--red)">Esta app está en modo local: no está sincronizando con nadie.</b>
+    <p class="hint" style="margin:6px 0 0">Los registros de los técnicos no llegan aquí y lo que corrijas no sale de este equipo.
+    Ve a <b>Conexión</b> y vuelve a elegir <b>Puente Apps Script</b> con su dirección.</p></div></div>` : ""}
+
   <div class="card"><header><h2>Estado</h2></header><div class="body"><div class="tw"><table><tbody>
-    <tr><td>Modo</td><td>${hasCloud?"Compartido — todos los técnicos ven los mismos datos":"Local — este dispositivo únicamente"}</td></tr>
+    ${(()=>{ const c=DB.meta.conexion||{};
+      /* Esta fila hablaba del almacenamiento del navegador, no del puente:
+         decía "Local" aunque la sincronización con Drive estuviera activa. */
+      const ok=c.modo==="script" && c.gsUrl;
+      return `<tr><td>Modo</td><td>${ok
+        ? `Compartido — sincroniza con Google <span class="chip c-verde">puente activo</span>`
+        : `Local — este dispositivo únicamente <span class="chip c-naranja">sin puente</span>`}</td></tr>`;})()}
     <tr style="background:#eaf1f8"><td><b>Versión del programa</b></td><td class="mono"><b>${VERSION_APP}</b> · estructura ${DB.meta.version||1}</td></tr>
+    ${(DB.meta.ultimaRespuesta||DB.meta.ultimaRespuestaConfig)?`<tr style="background:#fdefe5"><td>Última respuesta del puente<br><span class="tag">lo que contestó Google en la última subida</span></td>
+      <td class="mono" style="font-size:11px;word-break:break-all">${esc(DB.meta.ultimaRespuestaConfig||"")}<br>${esc(DB.meta.ultimaRespuesta||"")}</td></tr>`:""}
     <tr><td>Actividades activas</td><td class="tag">${DB.actividades.filter(a=>!a.noProductiva).map(a=>esc(a.nombre)).join(" · ")}</td></tr>
     ${(()=>{ const t=DB.meta.tamConfig||JSON.stringify(paqueteMaestros()).length;
-      const pct=Math.round(t/50000*100);
-      return `<tr style="${pct>85?"background:#fdefe5":""}">
-        <td>Tamaño de la configuración<br><span class="tag">Google Sheets no admite más de 50.000 caracteres por celda</span></td>
-        <td class="mono">${t.toLocaleString()} / 50.000 · ${pct}%
+      /* El puente v2 reparte la configuración en varias celdas: la capacidad
+         pasó de 50.000 a 400.000 caracteres. El aviso solo aplica si todavía
+         se está usando el puente antiguo. */
+      const TOPE=400000, pct=Math.round(t/TOPE*100);
+      return `<tr>
+        <td>Tamaño de la configuración<br><span class="tag">se reparte en varias celdas de CONFIG_APP · capacidad 400.000 caracteres</span></td>
+        <td class="mono">${t.toLocaleString()} / ${TOPE.toLocaleString()} · ${pct}%
         ${pct>85?'<br><span class="chip c-naranja">cerca del límite</span>':'<br><span class="chip c-verde">con holgura</span>'}</td></tr>`;})()}
     <tr style="${DB.meta.conexion.modo==="script"?"":"background:#fdefe5"}">
       <td>Copia de la configuración en Drive</td>
@@ -4761,6 +4965,7 @@ function aplicarFilas(filas, mapa){
       DB.ordenes.push(o); nOT++; }
     else { o.cuartoDeclaradoId=cuId||o.cuartoDeclaradoId||""; nAct++; }
     usadas.add(o.id);
+    o.vigente = true;              /* la hoja la trae: cuenta en Ingresos */
 
     const creados=[]; const pendientes=[]; const acum={};
     filasOT.forEach(({f,fIso})=>{
@@ -4795,7 +5000,10 @@ function aplicarFilas(filas, mapa){
       /* --- componentes de ESTA fila --- */
       if(!compCols.length) return;
       const crudo = idx.tipologias!==undefined ? String(f[idx.tipologias]||"").trim() : "";
-      if(crudo) o.tipoTexto = o.tipoTexto ? (o.tipoTexto.indexOf(crudo)>=0?o.tipoTexto:o.tipoTexto+" / "+crudo) : crudo;
+      /* La hoja manda: si en NUEVA PROGRAMACIÓN corrigen el TIPO (de FUSO a
+         TD04, por ejemplo), esa es la verdad. Antes se iba acumulando
+         "FUSO / TD04" y la corrección nunca se veía. */
+      if(crudo) o.tipoTexto = crudo;
       const ignorar=new Set(DB.meta.tokensIgnorados||[]);
       const protegido = crudo.replace(/(\d)\s*,\s*(\d)/g, "$1\u0001$2");
       const tokens = protegido.split(/[\/;|]+|,/)
@@ -4815,13 +5023,40 @@ function aplicarFilas(filas, mapa){
         /* Si la celda TIPO trae un solo texto, describe toda la orden y lo
            pueden usar todos los componentes: no se consume. */
         if(r.token && tokens.length>1) usados.add(r.token);
-        const tipo = r.tipo;
+        let tipo = r.tipo;
+        /* ¿Esa cantidad esconde más de una clase de bomba? */
+        /* El texto de la celda TIPO ya viene troceado en tokens; con eso basta
+           para saber si la orden es de un motor B7. */
+        const dg = desglosarComponente(tipo, cant, tokens.join(" ")+" "+(o.tipoTexto||""), cuartoOT);
+        if(dg){
+          dg.partes.forEach(p=>{
+            acum[p.tipo.id]=(acum[p.tipo.id]||0)+p.cant;
+            let c2=DB.componentes.find(c=>c.ordenId===o.id && c.tipoComponenteId===p.tipo.id);
+            if(c2){ c2.cantidad=acum[p.tipo.id]; c2.cuartoId=p.tipo.cuartoId; }
+            else { c2={id:idComponente(o.id,p.tipo.id,r.tip?r.tip.id:null),ordenId:o.id,
+              tipoComponenteId:p.tipo.id, tipologiaId:r.tip?r.tip.id:null, cantidad:acum[p.tipo.id],
+              cuartoId:p.tipo.cuartoId, estado:o.estado, serie:"", origen:"hoja"};
+              DB.componentes.push(c2); nC++; }
+            c2.origen=c2.origen||"hoja";
+            creados.push(c2);
+          });
+          /* Queda marcada en la orden para que coordinación la confirme, pero
+             NO va a la lista de avisos: no es un error de configuración, es
+             una lectura correcta que conviene verificar. */
+          o.revisar = dg.nota;
+          return;
+        }
         /* Varias filas de la misma OT y cuarto son entradas sucesivas de la
            misma orden (llegó un riel el martes, una bomba el jueves): se suman. */
         if(acum[tipo.id]!==undefined) repetidas++;
         acum[tipo.id]=(acum[tipo.id]||0)+cant;
         let comp = DB.componentes.find(c=>c.ordenId===o.id && c.tipoComponenteId===tipo.id);
-        if(comp){ comp.cantidad=acum[tipo.id]; if(r.tip && !comp.tipologiaId) comp.tipologiaId=r.tip.id; comp.cuartoId=tipo.cuartoId; }
+        if(comp){ comp.cantidad=acum[tipo.id];
+          /* La tipología también la manda la hoja, salvo que el componente lo
+             haya agregado alguien a mano. */
+          if(r.tip && comp.origen!=="manual" && comp.tipologiaId!==r.tip.id) comp.tipologiaId=r.tip.id;
+          else if(r.tip && !comp.tipologiaId) comp.tipologiaId=r.tip.id;
+          comp.cuartoId=tipo.cuartoId; }
         else { comp={id:idComponente(o.id,tipo.id,r.tip?r.tip.id:null),ordenId:o.id,tipoComponenteId:tipo.id,tipologiaId:r.tip?r.tip.id:null,
           cantidad:acum[tipo.id], cuartoId:tipo.cuartoId, estado:o.estado, serie:"", origen:"hoja"}; DB.componentes.push(comp); nC++; }
         comp.origen = comp.origen || "hoja";
@@ -4866,9 +5101,22 @@ function aplicarFilas(filas, mapa){
     if(sobra.length) porRevisar++;
   });
 
+  /* Ingresos es un ESPEJO de la hoja, no un acumulado.
+     Si una fila cambió de cuarto o de fecha, la orden vieja sigue existiendo
+     aquí pero YA NO ESTÁ en NUEVA PROGRAMACIÓN. Contarla infla los ingresos
+     con órdenes fantasma. Se marca fuera de vigencia: no se borra —conserva
+     los registros de los técnicos— pero deja de sumar en Ingresos. */
+  let fueraVigencia=0;
+  DB.ordenes.forEach(o=>{
+    if(o.origen==="manual"){ o.vigente=true; return; }
+    const corte=(DB.meta.conexion||{}).desdeFecha||"";
+    if(corte && o.fechaIngreso && o.fechaIngreso < corte) return;   /* fuera del corte: no se juzga */
+    if(!usadas.has(o.id) && o.vigente!==false){ o.vigente=false; fueraVigencia++; }
+  });
+
   if(sinComponente.length) avisos.push("Estas columnas quedaron sin componente porque no existe uno equivalente: "+
     [...new Set(sinComponente)].join(", ")+". Créalos en Maestros → Tipos de componente y asígnalos en Probar conexión.");
-  return {nOT,nC,nAct,omitidas,sinFecha,porRevisar,depurados,multi,repetidas,adoptadas,reasignadas,avisos,
+  return {nOT,nC,nAct,omitidas,sinFecha,porRevisar,depurados,multi,repetidas,adoptadas,reasignadas,avisos,fueraVigencia,
     nuevosEstados:[...new Set(nuevosEstados)]};
 }
 function importar(){
@@ -5016,8 +5264,15 @@ async function leerFuente(){
 async function empujarConfig(){
   const cx = DB.meta.conexion;
   if(!cx || cx.modo!=="script" || !cx.gsUrl) return;
-  await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body: JSON.stringify({accion:"config", config: paqueteMaestros()}), redirect:"follow"});
+  const paq = paqueteMaestros();
+  const cuerpoCfg = JSON.stringify({accion:"config", config: paq});
+  DB.meta.tamEnvioConfig = cuerpoCfg.length;
+  const rc = await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"},
+    body: cuerpoCfg, redirect:"follow"});
+  const tc = await rc.text().catch(()=>"");
+  DB.meta.ultimaRespuestaConfig = String(tc).slice(0,400);
+  let rp=null; try{ rp=JSON.parse(tc); }catch(e){}
+  if(rp && rp.ok===false) throw new Error("El puente rechazó la configuración: "+(rp.error||"sin detalle"));
   DB.meta.configSubido = new Date().toISOString();
   Store.set(KEY, DB, true);
 }
@@ -5045,7 +5300,8 @@ async function empujarRegistros(todo){
      manda todo, para dejar la hoja completa. */
   if(!DB.meta.subidaCompletaV2){ todo=true; }
   const desde = todo ? "" : (DB.meta.registrosSubidos||"");
-  const aSubir = DB.registros.filter(r=>puedoAportar(r) && (!desde || (r.actualizado||r.creado||"")>desde));
+  const aSubir = DB.registros.filter(r=>puedoAportar(r) &&
+    (r.pendienteSubir || !desde || (r.actualizado||r.creado||"")>desde));
   DB.meta.registrosOmitidos = DB.registros.length - aSubir.length;
   if(!aSubir.length) return true;                 /* nada nuevo: no molestamos al puente */
   const cuerpo = JSON.stringify({accion:"registros", registros: aSubir.map(r=>{
@@ -5070,9 +5326,17 @@ async function empujarRegistros(todo){
   /* text/plain evita el preflight CORS que Apps Script no responde */
   const r = await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:cuerpo, redirect:"follow"});
   if(!r.ok) throw new Error("HTTP "+r.status+" al subir los registros");
+  /* El puente responde 200 aunque falle, con el motivo dentro. Antes se
+     ignoraba y el error quedaba invisible. */
+  const txt = await r.text().catch(()=>"");
+  DB.meta.ultimaRespuesta = String(txt).slice(0,400);
+  let resp=null; try{ resp=JSON.parse(txt); }catch(e){}
+  if(resp && resp.ok===false) throw new Error("El puente respondió: "+(resp.error||"error sin detalle"));
   DB.meta.subidaError="";
   DB.meta.registrosSubidos=new Date().toISOString();
   DB.meta.subidaCompletaV2=true;
+  const subidos=new Set(aSubir.map(r=>r.id));
+  DB.registros.forEach(r=>{ if(subidos.has(r.id) && r.pendienteSubir) delete r.pendienteSubir; });
   return true;
 }
 async function sincronizar(silencioso){
@@ -5141,6 +5405,14 @@ async function sincronizar(silencioso){
           if(tR && tR > tL) local.set(r.id, r);           // el remoto es más nuevo
         });
         DB.registros = [...local.values()];
+        /* Autocuración: si un registro nuestro NO volvió de la hoja, es que
+           nunca llegó a subir. El envío incremental se guía por la fecha de
+           última subida, así que uno que quedó atrás jamás se reintentaba.
+           Al detectarlo se marca para que el siguiente envío lo incluya. */
+        const enHoja=new Set(registros.map(r=>r.id));
+        let faltantes=0;
+        DB.registros.forEach(r=>{ if(!enHoja.has(r.id)){ r.pendienteSubir=true; faltantes++; } });
+        res.faltantes=faltantes;
         if(Object.keys(aprendidas).length){
           DB.meta.remapeoIds = Object.assign({}, DB.meta.remapeoIds||{}, aprendidas);
           res.aprendidas = Object.keys(aprendidas).length;

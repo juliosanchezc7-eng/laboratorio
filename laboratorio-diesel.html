@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-17 · v48";
+const VERSION_APP = "2026-08-17 · v50";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -503,17 +503,25 @@ function actividadesDeComponente(tipoComponenteId, cuartoId){
 }
 /* Suma por fase, para el resumen en vivo del editor. */
 function resumenTiempos(tc){
-  const r={diagnostico:0, reparacion:0, entrega:0, apoyo:0, total:0};
+  /* Hay dos clases de minutos que no se pueden sumar a ciegas:
+       · por unidad — se multiplican por la cantidad de componentes
+       · por orden  — se cuentan una sola vez, lleguen 1 o 12
+     Sumarlos juntos daba un subtotal que no correspondía ni a una cosa
+     ni a la otra. Se llevan separados y se muestran así. */
+  const r={diagnostico:0, reparacion:0, entrega:0, apoyo:0, total:0,
+           dxOrden:0, rxOrden:0, exOrden:0, porOrden:0};
   minutosDelProceso(tc).forEach(e=>{
     const a=byId(DB.actividades,e.actividadId); if(!a || a.noProductiva) return;
     const m=+e.minutos||0;
     const f=(a.fase||"").toLowerCase();
-    if(f.indexOf("diagn")===0) r.diagnostico+=m;
-    else if(f.indexOf("entrega")===0) r.entrega+=m;
+    const uno=esPorOrden(e.actividadId);       /* una vez por orden */
+    if(f.indexOf("diagn")===0){ if(uno) r.dxOrden+=m; else r.diagnostico+=m; }
+    else if(f.indexOf("entrega")===0){ if(uno) r.exOrden+=m; else r.entrega+=m; }
     else if(f.indexOf("apoyo")===0) r.apoyo+=m;
-    else r.reparacion+=m;                      /* Lavado y Reparación cuentan como reparación */
+    else { if(uno) r.rxOrden+=m; else r.reparacion+=m; }
   });
-  r.total=r.diagnostico+r.reparacion+r.entrega;
+  r.porOrden=r.dxOrden+r.rxOrden+r.exOrden;
+  r.total=r.diagnostico+r.reparacion+r.entrega;   /* por unidad */
   return r;
 }
 /* De dónde salió el número, para mostrarlo al técnico y al coordinador. */
@@ -1641,11 +1649,17 @@ function pasoActividades(){
         Estás registrando en <b>${esc(nom(DB.cuartos,c.cuartoId))}</b>, que no es tu cuarto base.
         Las horas se te acreditan a ti; la producción, a ${esc(nom(DB.cuartos,c.cuartoId))}.</div>`:""}
       <div class="eyebrow" style="margin:14px 0 7px">Actividades de ${esc(nom(DB.cuartos,c.cuartoId))} · marca las que realizaste</div>
-      ${["Diagnóstico","Lavado","Reparación","Entrega","Apoyo"].map(fase=>{
-        const grupo = acts.filter(a=>a.fase===fase);
+      ${(()=>{ /* las marcadas "aparte" van en su propio bloque, no mezcladas
+                   con las fases del proceso normal */
+        const esAp=a=>{ const e=estandarDe(c.tipoComponenteId,a.id); return !!(e && e.aparte); };
+        return ["Diagnóstico","Lavado","Reparación","Entrega","Apoyo","Aparte"];})()
+       .map(fase=>{
+        const esAp=a=>{ const e=estandarDe(c.tipoComponenteId,a.id); return !!(e && e.aparte); };
+        const grupo = fase==="Aparte" ? acts.filter(esAp) : acts.filter(a=>a.fase===fase && !esAp(a));
         if(!grupo.length) return "";
         const simple = (DB.meta.capturaTiempo||"simple")==="simple";
-        return `<div class="tag" style="margin:11px 0 5px">${fase.toUpperCase()}</div>` + grupo.map(a=>{
+        return `<div class="tag" style="margin:11px 0 5px">${fase==="Aparte"
+          ? 'APARTE · solo si aplica en este trabajo' : fase.toUpperCase()}</div>` + grupo.map(a=>{
           const s = R.sel[a.id];
           const std = estandarMin(c.tipoComponenteId, c.tipologiaId, a.id);
           const cant = s? s.cantidad : c.cantidad;
@@ -3359,11 +3373,13 @@ function mTiempos(){
     <div class="tw"><table class="acc"><thead><tr>
       <th style="width:36px">Usa</th><th>Actividad</th><th class="num">Minutos</th><th class="num">% proceso</th>
     </tr></thead><tbody>
-      ${bloque("DIAGNÓSTICO",dg,r.diagnostico)}
-      ${bloque("REPARACIÓN",rp,r.reparacion, meta?` <span class="chip ${cuadra?"c-verde":"c-rojo"}">${cuadra?"cuadra con "+meta:"deberían ser "+meta+" · "+(r.reparacion>meta?"sobran "+(r.reparacion-meta):"faltan "+(meta-r.reparacion))}</span>`:"")}
-      ${bloque("ENTREGA",en,r.entrega)}
-      <tr class="cab"><td></td><td><b>TOTAL DEL PROCESO</b></td>
+      ${bloque("DIAGNÓSTICO",dg,r.diagnostico,r.dxOrden?` <span class="tag">+ ${r.dxOrden} min por orden</span>`:"")}
+      ${bloque("REPARACIÓN",rp,r.reparacion, (meta?` <span class="chip ${cuadra?"c-verde":"c-rojo"}">${cuadra?"cuadra con "+meta:"deberían ser "+meta+" · "+(r.reparacion>meta?"sobran "+(r.reparacion-meta):"faltan "+(meta-r.reparacion))}</span>`:"")+(r.rxOrden?` <span class="tag">+ ${r.rxOrden} min por orden</span>`:""))}
+      ${bloque("ENTREGA",en,r.entrega,r.exOrden?` <span class="tag">+ ${r.exOrden} min por orden</span>`:"")}
+      <tr class="cab"><td></td><td><b>TOTAL POR UNIDAD</b> <span class="tag">se multiplica por la cantidad</span></td>
         <td class="num mono"><b>${r.total}</b></td><td class="num mono">${hrs(r.total)} h</td></tr>
+      ${r.porOrden?`<tr class="cab"><td></td><td><b>ADEMÁS, POR ORDEN</b> <span class="tag">una sola vez, lleguen 1 o 12 unidades</span></td>
+        <td class="num mono"><b>${r.porOrden}</b></td><td class="num mono">${hrs(r.porOrden)} h</td></tr>`:""}
       ${ap.length?`<tr class="cab"><td></td><td><b>APARTE</b> <span class="tag">no suman al proceso · el técnico las marca solo cuando aplican</span></td><td></td><td></td></tr>
       ${ap.map(fila).join("")}`:""}
     </tbody></table></div>

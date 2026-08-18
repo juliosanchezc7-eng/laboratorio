@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-08-17 · v50";
+const VERSION_APP = "2026-08-17 · v51";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -3330,7 +3330,7 @@ function mTiempos(){
   const r=resumenTiempos(tipo.id);
   const meta=+tipo.estandarReparacion||0;         /* lo que la empresa dice que vale la reparación */
   const cuadra = !meta || r.reparacion===meta;
-  const acts=actividadesDe(tipo.cuartoId).filter(a=>!a.noProductiva);
+  let acts=actividadesDe(tipo.cuartoId).filter(a=>!a.noProductiva);
   const usados=DB.componentes.filter(c=>c.tipoComponenteId===tipo.id).length;
   const regs=DB.registros.filter(x=>!x.anulado && fotoComponente(x) && fotoComponente(x).tipoComponenteId===tipo.id).length;
 
@@ -3356,6 +3356,17 @@ function mTiempos(){
       <td class="num mono"><b>${suma}</b></td><td class="num mono">${r.total?(suma/r.total*100).toFixed(1)+"%":""}</td></tr>
     ${lista.map(fila).join("")}`:"";
 
+  /* Cualquier actividad con minutos guardados TIENE que verse, aunque no
+     pertenezca al cuarto o sea una duplicada: si suma al subtotal y no se
+     muestra, los números no cuadran y no hay forma de saber por qué. */
+  {
+    const yaEstan=new Set(acts.map(a=>a.id));
+    minutosPropios(tipo.id).forEach(e=>{
+      if(yaEstan.has(e.actividadId)) return;
+      const a=byId(DB.actividades,e.actividadId);
+      if(a && !a.noProductiva){ acts=acts.concat([a]); yaEstan.add(a.id); }
+    });
+  }
   const esAparte=a=>{ const e=estandarDe(tipo.id,a.id); return !!(e && e.aparte); };
   const dg=acts.filter(a=>!esAparte(a) && faseDe(a)==="Diagnóstico");
   const rp=acts.filter(a=>!esAparte(a) && faseDe(a)==="Reparación");

@@ -247,6 +247,13 @@ const uid = p => (p||"id") + "_" + Date.now().toString(36) + Math.random().toStr
 /* Fecha en formato AAAA-MM-DD usando SIEMPRE el calendario local.
    Antes se usaba toISOString(), que convierte a UTC: en Colombia (UTC-5)
    después de las 7 pm el día saltaba al siguiente. */
+/* El próximo lunes, para arrancar la medición en un corte limpio de semana. */
+function proxLunes(){
+  const d=new Date(); const falta=(8-d.getDay())%7 || 7;
+  d.setDate(d.getDate()+falta);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+const redondea2 = n => Math.round(n*100)/100;
 const isoLocal = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 const hoyISO = () => isoLocal(new Date());
 const restarDias = (iso,d) => { const x=new Date(iso+"T12:00:00"); x.setDate(x.getDate()-(+d||0)); return isoLocal(x); };
@@ -354,7 +361,7 @@ function semilla(){
     meta:{version:4, creado:new Date().toISOString(), pin:"", capturaTiempo:"simple",
       horario:{dias:{0:0,1:480,2:540,3:480,4:540,5:480,6:0}, breakMin:15, descontarBreak:false},
       inicioSemana:5,
-      conexion:{modo:"", csvUrl:"", gsUrl:"", autoMin:10, mapa:null, desdeFecha:"2026-05-01", sinFecha:"omitir", ultimaSync:"", ultimoError:""}},
+      conexion:{modo:"", csvUrl:"", gsUrl:"", clave:"", autoMin:10, mapa:null, desdeFecha:"2026-05-01", sinFecha:"omitir", ultimaSync:"", ultimoError:""}},
     cuartos, tecnicos, tiposComponente:tipos, tipologias, actividades, estandares,
     clientes:[],
     /* Festivos de Colombia 2026. Verifícalos y ajusta los que cambien. */
@@ -598,6 +605,23 @@ function capacidadTecnicoDia(tecnicoId, iso){
   if(trabajoEse(tecnicoId, iso)) return base;   /* volvió: la ausencia no aplica */
   return a.tipo==="media" ? Math.round(base/2) : 0;
 }
+/* Minutos registrados por un técnico en un día. */
+function minutosDia(tecnicoId, iso){
+  return RA().filter(r=>r.tecnicoId===tecnicoId && r.fecha===iso)
+             .reduce((a,r)=>a+(+r.minutos||0),0);
+}
+/* Lo que se pasó de su jornada, sumado día por día.
+   Se calcula por día y no sobre el total de la semana: quien trabaja 11 h el
+   lunes y 5 h el martes hizo 3 h extra el lunes, aunque la semana cuadre. */
+function minutosExtra(tecnicoId, desde, hasta){
+  let t=0; const a=new Date(desde+"T12:00:00"), b=new Date(hasta+"T12:00:00");
+  while(a<=b){
+    const iso=isoLocal(a);
+    t += Math.max(0, minutosDia(tecnicoId, iso) - capacidadTecnicoDia(tecnicoId, iso));
+    a.setDate(a.getDate()+1);
+  }
+  return t;
+}
 function capacidadTecnicoRango(tecnicoId, desde, hasta){
   let t=0; const a=new Date(desde+"T12:00:00"), b=new Date(hasta+"T12:00:00");
   while(a<=b){ t+=capacidadTecnicoDia(tecnicoId, isoLocal(a)); a.setDate(a.getDate()+1); }
@@ -718,6 +742,86 @@ function stdRegistro(comp, actividadId, cantidad){
 }
 function esNoProductiva(actividadId){ const a=byId(DB.actividades,actividadId); return !!(a && a.noProductiva); }
 function minutosNoProductivos(regs){ return regs.filter(r=>esNoProductiva(r.actividadId)).reduce((a,r)=>a+r.minutos,0); }
+
+/* =========================================================================
+   INDICADORES DE GESTIÓN
+   El tiempo lo declara el técnico, así que la ocupación siempre tiende al 100%:
+   nadie escribe "hoy rendí cinco horas". Sirve para saber si registró, no para
+   saber qué hizo.
+   Lo que NO se puede inflar son las unidades: vienen topadas por la orden de
+   PROGRAMACION. El cruce de horas contra unidades es lo que sostiene la lectura.
+   ========================================================================= */
+
+/* En qué se fue el tiempo. Las categorías se excluyen entre sí y se evalúan
+   en este orden, de la más específica a la más general. */
+function repartoTiempo(regs, tecnico){
+  const r = {noProd:0, sinOrden:0, apoyo:0, directo:0};
+  regs.forEach(x=>{
+    const m = +x.minutos||0;
+    if(esNoProductiva(x.actividadId))                      r.noProd  += m;
+    else if(x.sinOrden || (!x.ordenId && !x.otTexto))      r.sinOrden+= m;
+    else if(tecnico && x.cuartoId && x.cuartoId!==tecnico.cuartoId) r.apoyo += m;
+    else                                                   r.directo += m;
+  });
+  return r;
+}
+
+/* Mediana, no promedio: un solo trabajo largo no debe mover la referencia. */
+function mediana(arr){
+  if(!arr.length) return 0;
+  const a=arr.slice().sort((x,y)=>x-y), m=Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+}
+
+/* RITMO: minutos por unidad de cada técnico contra la mediana de sus compañeros
+   en la MISMA actividad y el MISMO tipo de componente.
+   No hace falta un tiempo estándar: el grupo es su propia referencia, y si todo
+   el cuarto se demora más este mes, la referencia se mueve con ellos.
+   Devuelve 1.00 = igual al grupo; 1.40 = tarda 40% más; 0.70 = 30% menos. */
+function ritmoPorTecnico(regs){
+  /* Solo comparan los registros con unidades y tiempo: lo demás no es medible. */
+  const utiles = regs.filter(r=>(+r.cantidad||0)>0 && (+r.minutos||0)>0 && !esNoProductiva(r.actividadId));
+  const grupos = {};
+  utiles.forEach(r=>{
+    const k = r.actividadId+"|"+(r.tipoComponenteId||"");
+    (grupos[k]=grupos[k]||[]).push(r);
+  });
+
+  const refs = {};
+  Object.entries(grupos).forEach(([k,rr])=>{
+    /* La referencia necesita al menos dos personas: si solo uno hace ese
+       trabajo, compararlo consigo mismo siempre da 1.00 y no dice nada. */
+    if(new Set(rr.map(r=>r.tecnicoId)).size < 2) return;
+    refs[k] = mediana(rr.map(r=>r.minutos/r.cantidad));
+  });
+
+  const porTec = {};
+  utiles.forEach(r=>{
+    const k = r.actividadId+"|"+(r.tipoComponenteId||"");
+    if(!refs[k]) return;
+    (porTec[r.tecnicoId]=porTec[r.tecnicoId]||[]).push((r.minutos/r.cantidad)/refs[k]);
+  });
+
+  const salida = {};
+  Object.entries(porTec).forEach(([id,v])=>{ salida[id]={ritmo:mediana(v), n:v.length}; });
+  return salida;
+}
+
+/* OPORTUNIDAD: qué tanto se registra el mismo día en que se trabajó.
+   Quien llena la semana el viernes está recordando, no midiendo: sus horas
+   valen menos como dato, y conviene saberlo antes de leer sus indicadores. */
+function oportunidad(regs){
+  const con = regs.filter(r=>r.creado && r.fecha);
+  if(!con.length) return {pct:0, n:0, demora:0};
+  const dias = con.map(r=>{
+    const hecho = new Date(r.fecha+"T12:00:00");
+    const puesto = new Date(r.creado);
+    return Math.max(0, Math.round((puesto-hecho)/86400000));
+  });
+  return {pct: Math.round(dias.filter(d=>d<=0).length*100/dias.length),
+          n: dias.length, demora: mediana(dias)};
+}
+
 /* AVANCE · qué parte del proceso ya se hizo, según el reparto porcentual.
    Es distinto del ESTADO: el estado lo pone coordinación en la hoja, el avance
    lo calcula la app con lo que los técnicos han registrado. */
@@ -954,6 +1058,7 @@ function migrar(){
   if(DB.meta.pin===undefined){ DB.meta.pin=""; n++; }
   if(!DB.meta.conexion){ DB.meta.conexion={modo:"",csvUrl:"",gsUrl:"",autoMin:10,mapa:null,desdeFecha:"",ultimaSync:"",ultimoError:""}; n++; }
   if(DB.meta.conexion.desdeFecha===undefined){ DB.meta.conexion.desdeFecha=""; n++; }
+  if(DB.meta.conexion.clave===undefined){ DB.meta.conexion.clave=""; n++; }
   if(!DB.meta.conexion.sinFecha){ DB.meta.conexion.sinFecha="omitir"; n++; }
   if(DB.meta.jornadaMin!==undefined){ delete DB.meta.jornadaMin; n++; }
   if(!DB.meta.capturaTiempo){ DB.meta.capturaTiempo="simple"; n++; }
@@ -1488,9 +1593,7 @@ const pedirTexto = (titulo,etiqueta,valor,tipo)=>dialogo({titulo,ok:"Aceptar",in
 const TABS = [
   ["registro","Mi registro","todos"],
   ["misemana","Mi semana","todos"],
-  ["ordenes","Órdenes","coord"],
   ["dashboard","Dashboard","coord"],
-  ["ingresos","Ingresos","coord"],
   ["semanal","Informe semanal","coord"],
   ["maestros","Maestros","coord"],
   ["conexion","Conexión","coord"],
@@ -1657,16 +1760,18 @@ function pasoActividades(){
         const esAp=a=>{ const e=estandarDe(c.tipoComponenteId,a.id); return !!(e && e.aparte); };
         const grupo = fase==="Aparte" ? acts.filter(esAp) : acts.filter(a=>a.fase===fase && !esAp(a));
         if(!grupo.length) return "";
-        const simple = (DB.meta.capturaTiempo||"simple")==="simple";
         return `<div class="tag" style="margin:11px 0 5px">${fase==="Aparte"
           ? 'APARTE · solo si aplica en este trabajo' : fase.toUpperCase()}</div>` + grupo.map(a=>{
           const s = R.sel[a.id];
-          const std = estandarMin(c.tipoComponenteId, c.tipologiaId, a.id);
           const cant = s? s.cantidad : c.cantidad;
+          /* El tiempo lo pone el técnico. No hay estándar que precargue ni
+             contra el cual comparar: la cifra es la que él midió. */
+          const uni = (s && s.unidad) || R.unidad || "min";
+          const valor = s ? (uni==="h" ? redondea2(s.minutos/60) : s.minutos) : "";
           return `<div class="act ${s?"on":""}" data-act="${a.id}">
             <div class="hd"><input type="checkbox" ${s?"checked":""} data-chk="${a.id}">
               <span class="nm">${esc(a.nombre)}</span>
-              <span class="std">${std?`${std} min${esPorOrden(a.id)?" por orden":"/und"}${origenEstandar(c.tipoComponenteId,c.tipologiaId,a.id)==="reparto"?` · ${repartoDe(c.tipoComponenteId,a.id)}% de la reparación`:""}`:"sin estándar"}</span></div>
+              <span class="std">${esPorOrden(a.id)?"por orden":"por unidad"}</span></div>
             <div class="det">
               <label><span>Unidades${(()=>{
                 const ya=yaRegistrado(c.id,a.id); if(!ya) return "";
@@ -1675,16 +1780,15 @@ function pasoActividades(){
                   .map(r=>nom(DB.tecnicos,r.tecnicoId)))];
                 return ` <span style="text-transform:none;letter-spacing:0;color:${queda<=0?"var(--red)":"var(--amber)"}">· ya van ${ya} de ${c.cantidad}${quienes.length?" · las registró "+esc(quienes.join(", ")):""}${queda>0?" · quedan "+queda:""}</span>`;})()}</span>
                 <input type="number" min="0" step="1" max="${Math.max(0,(c.cantidad||0)-yaRegistrado(c.id,a.id))}" data-cant="${a.id}" value="${cant}"></label>
-              ${simple?`
-              <label style="flex:1 1 100%;margin-top:2px">
-                <span style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;font-weight:500;color:var(--ink)">
-                  <input type="checkbox" data-adj="${a.id}" ${s&&s.ajustado?"checked":""} style="width:17px;height:17px;accent-color:var(--signal)">
-                  Se salió del estándar ${std?`(${hrs(esPorOrden(a.id)?std:std*(cant||1))} h esperadas)`:""}
-                </span></label>
-              ${s&&s.ajustado?`<label><span>Tiempo real (min)</span><input type="number" min="0" step="5" data-min="${a.id}" value="${s.minutos}"></label>`:""}
-              `:`
-              <label><span>Tiempo real (min)</span><input type="number" min="0" step="5" data-min="${a.id}" value="${s?s.minutos:(std*(c.cantidad||1)||60)}"></label>
-              `}
+              <label><span>Tiempo que gastaste</span>
+                <div style="display:flex;gap:6px">
+                  <input type="number" min="0" step="${uni==="h"?"0.25":"5"}" inputmode="decimal"
+                         data-tiempo="${a.id}" value="${valor}" placeholder="0" style="flex:1 1 auto">
+                  <select data-unidad="${a.id}" style="flex:0 0 90px">
+                    <option value="min" ${uni==="min"?"selected":""}>minutos</option>
+                    <option value="h" ${uni==="h"?"selected":""}>horas</option>
+                  </select>
+                </div></label>
             </div></div>`;
         }).join("");
       }).join("")}
@@ -1708,7 +1812,7 @@ function pasoNovedades(){
         ${DB.tiposNovedad.map(t=>`<option ${R.tipoNovedad===t?"selected":""}>${esc(t)}</option>`).join("")}</select></label>
       <label class="f"><span>Detalle</span>
         <textarea id="detNov" placeholder="Ej: faltó el kit de reparación, el banco EPS-205 quedó fuera de servicio a las 2pm…">${esc(R.novedad)}</textarea></label>
-      <p class="hint">Las novedades alimentan el informe semanal: son las causas que explican por qué el tiempo real se separa del estándar.</p>
+      <p class="hint">Las novedades alimentan el informe semanal: son las causas que explican por qué un trabajo tomó lo que tomó.</p>
     </div>
   </div>`;
 }
@@ -1742,7 +1846,7 @@ function hoyDelTecnico(){
         return `<tr><td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td>
         <td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?`${esc(r.compTexto)}`:`<span class="tag">—</span>`)}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td>
-        <td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td><td class="num">${hrs(r.minutosStd)}</td>
+        <td class="num">${r.cantidad}</td><td class="num">${hrs(r.minutos)}</td>
         <td><button class="btn sm danger" data-delreg="${r.id}">Borrar</button></td></tr>`;
       }).join("")}</tbody></table></div>`:`<div class="empty" style="margin-top:10px">Aún no hay registros para esta fecha.</div>`}
     </div>
@@ -1767,7 +1871,7 @@ function pRegistro(){
   };
   document.querySelectorAll("[data-chk]").forEach(ch=>ch.onchange=()=>{
     const id=ch.dataset.chk, c=byId(DB.componentes,R.componenteId);
-    if(ch.checked){ const std=estandarMin(c.tipoComponenteId,c.tipologiaId,id);
+    if(ch.checked){ const std=0;
       R.sel[id]={cantidad:c.cantidad||1, minutos:(std*(c.cantidad||1))||60, estado:"", ajustado:false}; }
     else delete R.sel[id];
     render();
@@ -1782,17 +1886,20 @@ function pRegistro(){
     }
     render();
   });
-  document.querySelectorAll("[data-adj]").forEach(i=>i.onchange=()=>{
-    const id=i.dataset.adj; if(!R.sel[id]) return;
-    R.sel[id].ajustado=i.checked;
-    if(!i.checked){
-      const cc=byId(DB.componentes,R.componenteId);
-      const std=cc?estandarMin(cc.tipoComponenteId,cc.tipologiaId,id):0;
-      R.sel[id].minutos = std*(R.sel[id].cantidad||1);
-    }
+  /* El tiempo se guarda SIEMPRE en minutos; la unidad es solo para escribirlo.
+     Así un registro hecho en horas y otro en minutos suman igual. */
+  document.querySelectorAll("[data-tiempo]").forEach(i=>i.oninput=()=>{
+    const id=i.dataset.tiempo; if(!R.sel[id]) return;
+    const uni=(R.sel[id].unidad)||R.unidad||"min";
+    const v=parseFloat(String(i.value).replace(",","."))||0;
+    R.sel[id].minutos = uni==="h" ? Math.round(v*60) : Math.round(v);
+  });
+  document.querySelectorAll("[data-unidad]").forEach(sel=>sel.onchange=()=>{
+    const id=sel.dataset.unidad; if(!R.sel[id]) return;
+    R.sel[id].unidad = sel.value;
+    R.unidad = sel.value;                 /* la siguiente actividad hereda la elección */
     render();
   });
-  document.querySelectorAll("[data-min]").forEach(i=>i.onchange=()=>{ const id=i.dataset.min; if(R.sel[id]) R.sel[id].minutos=+i.value||0; });
   const $eo=$("#estadoOrden"); if($eo) $eo.onchange=e=>R.estadoOrden=e.target.value;
   const $t=$("#tipoNov"); if($t) $t.onchange=e=>R.tipoNovedad=e.target.value;
   const $d=$("#detNov"); if($d) $d.oninput=e=>R.novedad=e.target.value;
@@ -1823,12 +1930,30 @@ async function guardarRegistro(){
     if(!await confirmar("Más unidades de las que tiene la orden",
       msg+"Como coordinación puedes continuar, pero el indicador de entregas quedará por encima de lo que ingresó.","Guardar de todos modos")) return;
   }
+  /* Nadie tiene 11 h en una jornada de 8. Si se pasa, se pregunta: puede ser
+     hora extra de verdad, o un dedazo. Se avisa, no se bloquea. */
+  const capHoy   = capacidadTecnicoDia(YO, R.fecha);
+  const yaHoy    = minutosDia(YO, R.fecha);
+  const porGuardar = Object.values(R.sel).reduce((a,x)=>a+(+x.minutos||0),0);
+  let esExtra = false;
+  if(capHoy && (yaHoy + porGuardar) > capHoy){
+    const exceso = yaHoy + porGuardar - capHoy;
+    esExtra = await confirmar("Se pasa de la jornada",
+      `Ese día tienes ${hrs(capHoy)} h de jornada.\n`
+      +`Ya llevabas ${hrs(yaHoy)} h y vas a agregar ${hrs(porGuardar)} h: quedarían ${hrs(yaHoy+porGuardar)} h.\n\n`
+      +`Son ${hrs(exceso)} h por encima.\n\n`
+      +`Si de verdad fueron horas extra, guárdalas y quedan marcadas como tal.\n`
+      +`Si te equivocaste al escribir el tiempo, cancela y corrígelo.`,
+      "Sí, fueron horas extra");
+    if(!esExtra) return;
+  }
   const nuevos = Object.entries(R.sel).map(([actId,s])=>({
     id:uid("rg"), fecha:R.fecha, tecnicoId:YO, ordenId:R.ordenId, componenteId:R.componenteId,
     cuartoId:c.cuartoId, actividadId:actId, cantidad:+s.cantidad||0, minutos:+s.minutos||0,
     tipoComponenteId:c.tipoComponenteId, tipologiaId:c.tipologiaId||null,   /* foto: sobrevive a la orden */
-    minutosStd: stdRegistro(c, actId, s.cantidad),
-    tiempoMedido: !!s.ajustado,
+    minutosStd: 0,                       /* se conserva el campo por compatibilidad */
+    extra: esExtra,                      /* declarado por el técnico al pasarse de jornada */
+    tiempoMedido: true,                  /* ahora TODO tiempo es medido por el técnico */
     estadoNuevo:R.estadoOrden||"", tipoNovedad:R.tipoNovedad||"", novedad:R.novedad||"",
     creado:new Date().toISOString(), creadoPor:YO, historial:[],
     actualizado:new Date().toISOString(),
@@ -1873,15 +1998,19 @@ function vMiSemana(){
   const rs = RA().filter(r=>r.tecnicoId===YO && r.fecha>=d && r.fecha<=h);
   const real = rs.reduce((a,r)=>a+r.minutos,0);
   const std = rs.reduce((a,r)=>a+r.minutosStd,0);
-  const cap = capacidadRango(d,h);
+  /* La jornada del técnico que está mirando, descontando sus ausencias. */
+  const cap = capacidadTecnicoRango(YO, d, h);
+  const capCal = capacidadRango(d,h);
   const ocup = cap? Math.round(real/cap*100):0;
   const nombresDia=["Domingo","Lunes","Martes","Miércoles","Jueves","Viernes","Sábado"];
   const dias=[]; const a=new Date(d+"T12:00:00");
   for(let i=0;i<7;i++){ const iso=isoLocal(a);
-    const c=capacidadDia(iso);
-    if(c>0) dias.push({iso, dow:new Date(iso+"T12:00:00").getDay(), cap:c, min:rs.filter(r=>r.fecha===iso).reduce((x,r)=>x+r.minutos,0)});
+    const cCal=capacidadDia(iso);
+    const c=capacidadTecnicoDia(YO, iso);
+    if(cCal>0) dias.push({iso, dow:new Date(iso+"T12:00:00").getDay(), cap:c, capCal:cCal,
+      ausente:c<cCal, min:rs.filter(r=>r.fecha===iso).reduce((x,r)=>x+r.minutos,0)});
     a.setDate(a.getDate()+1); }
-  const maxD = Math.max(1,...dias.map(x=>x.cap));
+  const maxD = Math.max(1,...dias.map(x=>x.capCal));
 
   return cabSync + `
   <div class="card"><div class="body"><div class="row" style="align-items:end">
@@ -1892,10 +2021,11 @@ function vMiSemana(){
   </div></div></div>
 
   <div class="kpis" style="margin-bottom:14px">
-    <div class="kpi"><div class="l">Horas registradas</div><div class="v">${hrs(real)}</div><div class="h">de ${hrs(cap)} h de la semana</div></div>
-    <div class="kpi"><div class="l">Cumplimiento</div><div class="v">${ocup}%</div>
-      <div class="gauge"><i class="${ocup>=90?"ok":ocup>=60?"warn":"bad"}" style="width:${Math.min(100,ocup)}%"></i></div></div>
-    <div class="kpi"><div class="l">Producción estándar</div><div class="v">${hrs(std)}</div><div class="h">${real?Math.round(std/real*100):0}% vs tiempo real</div></div>
+    <div class="kpi"><div class="l">Horas registradas</div><div class="v">${hrs(real)}</div><div class="h">de ${hrs(cap)} h de la semana${cap<capCal?` · ${hrs(capCal-cap)} h descontadas por ausencia`:""}</div></div>
+    <div class="kpi"><div class="l">Ocupación</div><div class="v">${ocup}%</div>
+      <div class="h">${(()=>{const ex=minutosExtra(YO,d,h); return ex?`${hrs(ex)} h por encima de la jornada`:"dentro de la jornada";})()}</div>
+      <div class="gauge"><i class="${ocup>100?"warn":ocup>=90?"ok":ocup>=60?"warn":"bad"}" style="width:${Math.min(100,ocup)}%"></i></div></div>
+    <div class="kpi"><div class="l">Unidades trabajadas</div><div class="v">${rs.reduce((x,r)=>x+r.cantidad,0)}</div><div class="h">en ${new Set(rs.map(r=>r.ordenId)).size} órdenes</div></div>
     ${(()=>{const me=byId(DB.tecnicos,YO); const fuera=rs.filter(r=>me&&r.cuartoId!==me.cuartoId);
       const mf=fuera.reduce((a,r)=>a+r.minutos,0);
       return mf?`<div class="kpi"><div class="l">Apoyo a otros cuartos</div><div class="v">${hrs(mf)}</div>
@@ -1905,8 +2035,8 @@ function vMiSemana(){
 
   <div class="card"><header><h2>Día por día</h2></header><div class="body"><div class="bars">
     ${dias.map(x=>`<div class="bar"><div class="t">${nombresDia[x.dow]}</div>
-      <div class="track"><i class="${x.min>=x.cap*0.9?"":"b"}" style="width:${Math.min(100,x.min/maxD*100)}%"></i></div>
-      <div class="n">${hrs(x.min)} / ${hrs(x.cap)} h</div></div>`).join("")}
+      <div class="track"><i class="${x.cap&&x.min>=x.cap*0.9?"":"b"}" style="width:${Math.min(100,x.min/maxD*100)}%"></i></div>
+      <div class="n">${x.cap? `${hrs(x.min)} / ${hrs(x.cap)} h${x.min>x.cap?` <span class="chip c-naranja" title="Por encima de la jornada">+${hrs(x.min-x.cap)}</span>`:""}` : (x.min?`<span class="chip c-naranja">${hrs(x.min)} h en día ausente</span>`:`<span class="chip c-azul">ausente</span>`)}</div></div>`).join("")}
   </div></div></div>
 
   <div class="card"><header><h2>Mis registros</h2><span class="sub mono">${rs.length}</span></header><div class="body">
@@ -2166,7 +2296,9 @@ function vDashboard(){
   /* El denominador tiene que ser del MISMO grupo que el numerador: si se
      filtra por cuarto, la jornada disponible también. */
   const capTotal = Math.max(0, capacidadEquipoRango(d,h,FD.cuarto,FD.tecnico) - minNoProd);
-  const prod = capTotal? Math.round(std/capTotal*100):0;
+  /* Ocupación: horas registradas contra la jornada que de verdad hubo.
+     Reemplaza a la productividad, que dependía de los tiempos estándar. */
+  const ocupDash = capTotal? Math.round(real/capTotal*100):0;
   const undTerm = rs.filter(r=>r.actividadId==="ac_prueba_fin"||r.actividadId==="ac_empaque").reduce((a,r)=>a+r.cantidad,0);
   const otsTocadas = new Set(rs.map(r=>r.ordenId)).size;
   const cerrDash = cerrados();
@@ -2177,11 +2309,14 @@ function vDashboard(){
   const pendRep = bloqueadas;
 
   // ocupación por técnico
-  const capSem = capacidadRango(d,h);
+  /* Cada técnico se mide contra SU jornada, no contra la del calendario.
+     Quien estuvo incapacitado dos días no tenía 40.75 h disponibles. */
   const porTec = DB.tecnicos.filter(t=>t.activo!==false && t.rol!=="coordinador").map(t=>{
     const rr=rs.filter(r=>r.tecnicoId===t.id);
     const m=rr.reduce((a,x)=>a+x.minutos,0), s=rr.reduce((a,x)=>a+x.minutosStd,0);
-    return {t, min:m, std:s, cap:capSem};
+    const capReal=capacidadTecnicoRango(t.id,d,h);
+    return {t, min:m, std:s, cap:capReal, aus:capacidadRango(d,h)-capReal,
+            ex:minutosExtra(t.id,d,h)};
   }).sort((a,b)=>b.min-a.min);
   const maxT = Math.max(1,...porTec.map(x=>Math.max(x.cap,x.min)));
 
@@ -2205,12 +2340,62 @@ function vDashboard(){
 
   return `
   ${filtrosDash()}
+  ${(()=>{
+    /* Órdenes cuya lectura de componentes quedó dudosa. Antes esto solo se veía
+       en la pestaña Órdenes; sin ella, el aviso vive aquí para que nadie
+       registre sobre una orden mal leída sin enterarse. */
+    const rev = DB.ordenes.filter(o=>o.revisar);
+    if(!rev.length) return "";
+    return `<div class="card" style="border-color:#f3ccb0;background:#fdefe5;margin-bottom:14px">
+      <div class="body" style="padding:11px 14px">
+        <b style="color:var(--signal)">${rev.length} orden(es) por revisar</b>
+        <p class="hint" style="margin:5px 0 0">La celda TIPO trae algo que no se pudo ubicar en un componente,
+        o la cantidad se repartió por costumbre del taller. Corrige en PROGRAMACION y vuelve a sincronizar.</p>
+        <div style="margin-top:7px;font-family:var(--mono);font-size:12.5px;color:var(--ink-2)">
+          ${rev.slice(0,12).map(o=>esc(o.ot||"?")).join(" · ")}${rev.length>12?` · y ${rev.length-12} más`:""}</div>
+      </div></div>`;
+  })()}
+  ${(()=>{
+    /* Días en los que lo registrado no cabe en la jornada. Los registros hechos
+       antes de que existiera el aviso nunca se confirmaron como extra, así que
+       hay que poder revisarlos sin perseguir a nadie uno por uno. */
+    const casos=[];
+    tecnicosQueCuentan(d,h,FD.cuarto,FD.tecnico).forEach(t=>{
+      const a=new Date(d+"T12:00:00"), b=new Date(h+"T12:00:00");
+      while(a<=b){
+        const iso=isoLocal(a);
+        const min=minutosDia(t.id,iso), cap=capacidadTecnicoDia(t.id,iso);
+        if(min>cap) casos.push({t,iso,min,cap,
+          motivo: cap? "por encima de la jornada" : (capacidadDia(iso)? "día marcado como ausente" : "día no laboral")});
+        a.setDate(a.getDate()+1);
+      }
+    });
+    if(!casos.length) return "";
+    casos.sort((x,y)=>(y.min-y.cap)-(x.min-x.cap));
+    return `<div class="card" style="border-color:#f3ccb0;background:#fdefe5;margin-bottom:14px">
+      <header style="background:transparent;border-bottom-color:#f3ccb0">
+        <h2 style="color:var(--signal)">${casos.length} día(s) con más horas que la jornada</h2>
+        <span class="sub">horas extra, o un tiempo mal escrito</span></header>
+      <div class="body" style="padding-top:10px">
+        <div class="tw"><table><thead><tr><th>Técnico</th><th>Día</th><th class="num">Registró</th><th class="num">Jornada</th><th class="num">Exceso</th><th>Situación</th></tr></thead><tbody>
+        ${casos.slice(0,20).map(c=>`<tr><td><b>${esc(c.t.nombre)}</b></td>
+          <td class="mono">${fmtFecha(c.iso)}</td>
+          <td class="num">${hrs(c.min)} h</td>
+          <td class="num">${hrs(c.cap)} h</td>
+          <td class="num"><span class="chip c-naranja">+${hrs(c.min-c.cap)} h</span></td>
+          <td>${c.motivo}</td></tr>`).join("")}
+        </tbody></table></div>
+        ${casos.length>20?`<p class="hint">y ${casos.length-20} más</p>`:""}
+        <p class="hint" style="margin-top:9px">Pregunta antes de asumir. Si fueron extras de verdad, el dato está bien y conviene
+        dejarlo así. Si el técnico se equivocó al escribir el tiempo, coordinación puede corregir ese registro.</p>
+      </div></div>`;
+  })()}
   <div class="kpis" style="margin-bottom:14px">
     <div class="kpi"><div class="l">Horas registradas</div><div class="v">${hrs(real)}</div><div class="h">${rs.length} registros</div></div>
-    <div class="kpi"><div class="l">Horas estándar</div><div class="v">${hrs(std)}</div><div class="h">producción valorada</div></div>
-    <div class="kpi"><div class="l">Productividad</div><div class="v">${prod}%</div>
-      <div class="h">ganadas / disponibles</div>
-      <div class="gauge"><i class="${prod>=85?"ok":prod>=60?"warn":"bad"}" style="width:${Math.min(100,prod)}%"></i></div></div>
+    <div class="kpi"><div class="l">Unidades trabajadas</div><div class="v">${rs.reduce((a,r)=>a+r.cantidad,0)}</div><div class="h">en ${otsTocadas} órdenes</div></div>
+    <div class="kpi"><div class="l">Ocupación</div><div class="v">${ocupDash}%</div>
+      <div class="h">${hrs(real)} de ${hrs(capTotal)} h disponibles</div>
+      <div class="gauge"><i class="${ocupDash>=85?"ok":ocupDash>=60?"warn":"bad"}" style="width:${Math.min(100,ocupDash)}%"></i></div></div>
     <div class="kpi"><div class="l">Componentes terminados</div><div class="v">${undTerm}</div><div class="h">${otsTocadas} OT trabajadas</div></div>
   </div>
   <div class="kpis" style="margin-bottom:14px">
@@ -2224,11 +2409,11 @@ function vDashboard(){
   </div>
 
   <div class="grid g2">
-    <div class="card"><header><h2>Carga por técnico</h2><span class="sub mono">azul = real · naranja = estándar</span></header>
+    <div class="card"><header><h2>Carga por técnico</h2><span class="sub mono">horas registradas contra su jornada</span></header>
       <div class="body">${porTec.length?`<div class="bars">${porTec.map(x=>`
         <div class="bar"><div class="t">${esc(x.t.nombre)}</div>
-          <div class="track"><i style="width:${x.min/maxT*100}%"></i><i class="b" style="width:${Math.min(100,x.std/maxT*100)}%;height:5px;top:auto"></i></div>
-          <div class="n">${hrs(x.min)} / ${hrs(x.cap)} h</div></div>`).join("")}</div>`:`<div class="empty">Sin datos en el rango.</div>`}</div></div>
+          <div class="track"><i style="width:${Math.min(100,x.min/maxT*100)}%"></i></div>
+          <div class="n">${hrs(x.min)} / ${hrs(x.cap)} h${x.aus>0?` <span class="chip c-azul" title="Jornada descontada por ausencia">−${hrs(x.aus)} h</span>`:""}${x.ex>0?` <span class="chip c-naranja" title="Registró más horas que su jornada">+${hrs(x.ex)} h</span>`:""}</div></div>`).join("")}</div>`:`<div class="empty">Sin datos en el rango.</div>`}</div></div>
 
     <div class="card"><header><h2>Horas por cuarto</h2></header>
       <div class="body">${porCuarto.length?`<div class="bars">${porCuarto.map(x=>`
@@ -2711,10 +2896,11 @@ function vSemanal(){
     const capReal=capacidadTecnicoRango(t.id,d,h);        /* su jornada, no la del grupo */
     const capT=Math.max(1, capReal-np);
     const aus=capDia-capReal;                              /* lo que perdió por ausencia */
-    return {t,m,s,u,np,aus,capReal,ef:m?Math.round(s/m*100):0,
-      oc:capReal?Math.round(m/capReal*100):0, pr:Math.round(s/capT*100)};
+    return {t,m,s,u,np,aus,capReal, ex:minutosExtra(t.id,d,h),
+      oc:capReal?Math.round(m/capReal*100):0};
   }).sort((a,b)=>b.m-a.m);
 
+  const ritmos = ritmoPorTecnico(rs);
   const entregadas=DB.ordenes.filter(o=>/entregad/i.test(o.estado||"")).length;
   const novs={}; rs.forEach(r=>{ if(r.tipoNovedad){ (novs[r.tipoNovedad]=novs[r.tipoNovedad]||[]).push(r); } });
 
@@ -2734,21 +2920,64 @@ function vSemanal(){
         <div class="kpi"><div class="l">Horas productivas</div><div class="v">${hrs(real)}</div><div class="h">de ${hrs(cap)} h disponibles</div>
           <div class="gauge"><i class="${ocup>=85?"ok":ocup>=60?"warn":"bad"}" style="width:${Math.min(100,ocup)}%"></i></div></div>
         <div class="kpi"><div class="l">Ocupación</div><div class="v">${ocup}%</div><div class="h">${activos.length} técnicos · ${hrs(capDia)} h c/u${minNoProd?` · ${hrs(minNoProd)} h no productivas`:""}</div></div>
-        <div class="kpi"><div class="l">Productividad</div><div class="v">${cap?Math.round(std/cap*100):0}%</div>
-          <div class="h">horas ganadas / disponibles</div>
-          <div class="gauge"><i class="${cap&&std/cap>=.85?"ok":cap&&std/cap>=.6?"warn":"bad"}" style="width:${Math.min(100,cap?std/cap*100:0)}%"></i></div></div>
+        <div class="kpi"><div class="l">Unidades trabajadas</div><div class="v">${rs.reduce((a,r)=>a+r.cantidad,0)}</div>
+          <div class="h">${new Set(rs.map(r=>r.ordenId)).size} órdenes tocadas</div></div>
         <div class="kpi"><div class="l">OT entregadas (total)</div><div class="v">${entregadas}</div><div class="h">${DB.ordenes.length} en el histórico</div></div>
       </div>
     </div></div>
 
-  <div class="card"><header><h2>Producción por técnico</h2></header><div class="body"><div class="tw"><table>
-    <thead><tr><th>Técnico</th><th>Cuarto</th><th class="num">Horas</th><th class="num">Std</th><th class="num">No prod.</th><th class="num">Productividad</th><th class="num">Ocupación</th></tr></thead>
+  <div class="card"><header><h2>Qué hizo cada técnico</h2>
+    <span class="sub">el tiempo lo declara él; las unidades las topa la orden</span></header><div class="body">
+    <p class="hint" style="margin-top:0">
+      <b>Ritmo</b> compara sus minutos por unidad contra la mediana de sus compañeros en la misma actividad
+      y el mismo componente. <b>1.00</b> es ir al paso del cuarto; <b>1.40</b> es tardar 40% más.
+      No hay tiempo estándar: la referencia sale del propio grupo, así que si todos se demoran más este mes,
+      la referencia se mueve con ellos. Se calcula solo donde al menos dos personas hicieron el mismo trabajo.<br>
+      <b>Oportunidad</b> es qué parte registró el mismo día. Quien llena la semana el viernes está recordando,
+      no midiendo: mira ese número antes de leer los demás.
+    </p>
+    <div class="tw"><table>
+    <thead><tr><th>Técnico</th><th class="num">Directo</th><th class="num">Apoyo</th><th class="num">Sin orden</th><th class="num">No prod.</th><th class="num">Unidades</th><th class="num">Ritmo</th><th class="num">Mismo día</th></tr></thead>
+    <tbody>${activos.map(t=>{
+      const rr=rs.filter(r=>r.tecnicoId===t.id);
+      const rep=repartoTiempo(rr,t);
+      const ri=ritmos[t.id];
+      const op=oportunidad(rr);
+      const und=rr.reduce((a,x)=>a+(+x.cantidad||0),0);
+      const tot=rep.directo+rep.apoyo+rep.sinOrden+rep.noProd;
+      const barra=(v,color)=>tot?`<div style="height:5px;background:${color};width:${v/tot*100}%"></div>`:"";
+      return `<tr><td><b>${esc(t.nombre)}</b><br>
+          <div style="display:flex;height:5px;border-radius:3px;overflow:hidden;background:#eef1f3;margin-top:4px;max-width:170px">
+            ${barra(rep.directo,"var(--prussian-2)")}${barra(rep.apoyo,"var(--green)")}${barra(rep.sinOrden,"var(--amber)")}${barra(rep.noProd,"#b8c4cd")}</div></td>
+        <td class="num">${rep.directo?hrs(rep.directo):"—"}</td>
+        <td class="num">${rep.apoyo?hrs(rep.apoyo):"—"}</td>
+        <td class="num">${rep.sinOrden?`<span class="chip c-ambar">${hrs(rep.sinOrden)}</span>`:"—"}</td>
+        <td class="num">${rep.noProd?hrs(rep.noProd):"—"}</td>
+        <td class="num">${und||"—"}</td>
+        <td class="num">${ri&&ri.n>=3
+          ? `<span class="chip ${ri.ritmo<=1.15?"c-verde":ri.ritmo<=1.5?"c-ambar":"c-naranja"}" title="${ri.n} trabajos comparables">${ri.ritmo.toFixed(2)}</span>`
+          : `<span class="tag" title="${ri?ri.n:0} trabajos comparables · hacen falta 3">sin base</span>`}</td>
+        <td class="num">${op.n?`<span class="chip ${op.pct>=80?"c-verde":op.pct>=50?"c-ambar":"c-naranja"}" title="demora mediana: ${op.demora} día(s)">${op.pct}%</span>`:"—"}</td></tr>`;
+    }).join("")}</tbody></table></div>
+    <div class="cohorte-pie" style="display:flex;gap:15px;flex-wrap:wrap;margin-top:9px;font-size:12px;color:var(--ink-2)">
+      <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--prussian-2);margin-right:5px"></i>Directo sobre piezas</span>
+      <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--green);margin-right:5px"></i>Apoyo a otro cuarto</span>
+      <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--amber);margin-right:5px"></i>Sin orden</span>
+      <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#b8c4cd;margin-right:5px"></i>No productivo</span>
+    </div>
+  </div></div>
+
+  <div class="card"><header><h2>Jornada por técnico</h2></header><div class="body"><div class="tw"><table>
+    <thead><tr><th>Técnico</th><th>Cuarto</th><th class="num">Horas</th><th class="num">Jornada</th><th class="num">Ausencia</th><th class="num">Extra</th><th class="num">No prod.</th><th class="num">Unidades</th><th class="num">Ocupación</th></tr></thead>
     <tbody>${tec.map(x=>`<tr><td><b>${esc(x.t.nombre)}</b></td><td>${esc(nom(DB.cuartos,x.t.cuartoId))}</td>
-      <td class="num">${hrs(x.m)}</td><td class="num">${hrs(x.s)}</td>
+      <td class="num">${hrs(x.m)}</td>
+      <td class="num">${hrs(x.capReal)}</td>
+      <td class="num">${x.aus>0?`<span class="chip c-azul">−${hrs(x.aus)}</span>`:"—"}</td>
+      <td class="num">${x.ex>0?`<span class="chip c-naranja">+${hrs(x.ex)}</span>`:"—"}</td>
       <td class="num">${x.np?hrs(x.np):"—"}</td>
-      <td class="num">${x.pr?`<span class="chip ${x.pr>=90?"c-verde":x.pr>=65?"c-ambar":"c-naranja"}">${x.pr}%</span>`:"—"}</td>
-      <td class="num">${x.oc}%</td></tr>`).join("")}
-    <tr style="background:#f7f9fa"><td><b>TOTAL</b></td><td></td><td class="num"><b>${hrs(real)}</b></td><td class="num"><b>${hrs(std)}</b></td><td class="num"><b>${hrs(minNoProd)}</b></td><td class="num"><b>${cap?Math.round(std/cap*100):0}%</b></td><td class="num"><b>${ocup}%</b></td></tr>
+      <td class="num">${x.u||"—"}</td>
+      <td class="num">${x.oc?`<span class="chip ${x.oc>=90?"c-verde":x.oc>=65?"c-ambar":"c-naranja"}">${x.oc}%</span>`:"—"}</td></tr>`).join("")}
+    <tr style="background:#f7f9fa"><td><b>TOTAL</b></td><td></td><td class="num"><b>${hrs(real)}</b></td><td class="num"><b>${hrs(cap)}</b></td><td class="num"><b>${hrs(minutosAusencia(d,h))}</b></td><td class="num"><b>${hrs(tec.reduce((a,x)=>a+x.ex,0))}</b></td><td class="num"><b>${hrs(minNoProd)}</b></td><td class="num"><b>${tec.reduce((a,x)=>a+x.u,0)}</b></td><td class="num"><b>${ocup}%</b></td></tr>
     </tbody></table></div></div></div>
 
   <div class="card"><header><h2>Novedades y causas de desviación</h2></header><div class="body">
@@ -2774,11 +3003,13 @@ function pSemanal(){
 /* =========================================================================
    VISTA 5 · MAESTROS (todo editable)
    ========================================================================= */
-let MSEC="tiempos";
+let MSEC="tecnicos";
 let RAPIDO=false;
 let MFILTRO={cuarto:"", tipo:""};
 function vMaestros(){
-  const secciones=[["tiempos","Tiempos"],["tecnicos","Técnicos"],["cuartos","Cuartos"],["tiposComponente","Tipos de componente"],["tipologias","Tipologías"],["actividades","Actividades"],["listas","Listas"],["estandares","Tabla completa"],["reparto","Reparto (avanzado)"]];
+  /* Se retiran "Tiempos", "Tabla completa" y "Reparto": existían para mantener
+     los tiempos estándar, que ya no se usan. El tiempo lo pone el técnico. */
+  const secciones=[["tecnicos","Técnicos"],["cuartos","Cuartos"],["tiposComponente","Tipos de componente"],["tipologias","Tipologías"],["actividades","Actividades"],["listas","Listas"]];
   return `
   <div class="card"><header><h2>Maestros</h2><span class="sub">Todo lo que aparece en el registro sale de aquí</span></header>
   <div class="body"><div class="seg">${secciones.map(([k,l])=>`<button data-ms="${k}" class="${MSEC===k?"on":""}">${l}</button>`).join("")}</div>
@@ -2786,7 +3017,7 @@ function vMaestros(){
     <input type="checkbox" id="modoRapido" ${RAPIDO?"checked":""} style="width:17px;height:17px;accent-color:var(--signal)">
     <span>Borrado rápido — elimina sin preguntar lo que no tenga datos asociados. Útil para limpiar los ejemplos de una vez.</span></label>
   </div></div>
-  ${({tiempos:mTiempos,tecnicos:mTecnicos,cuartos:mCuartos,tiposComponente:mTipos,tipologias:mTipologias,actividades:mActividades,estandares:mEstandares,reparto:mReparto,listas:mListas}[MSEC]||mTiempos)()}`;
+  ${({tecnicos:mTecnicos,cuartos:mCuartos,tiposComponente:mTipos,tipologias:mTipologias,actividades:mActividades,listas:mListas}[MSEC]||mTecnicos)()}`;
 }
 function mTecnicos(){
   return `<div class="card"><header><h2>Técnicos</h2><div class="push"><button class="btn sm primary" data-add="tecnico">+ Técnico</button></div></header>
@@ -3761,7 +3992,7 @@ function mListas(){
       <option value="0" ${!h.descontarBreak?"selected":""}>No — cuenta dentro de la jornada</option></select></label>
     <label class="f" style="max-width:330px"><span>Captura del tiempo</span>
       <select id="captura">
-        <option value="simple" ${(DB.meta.capturaTiempo||"simple")==="simple"?"selected":""}>Simple — el técnico registra cantidad; el tiempo sale del estándar</option>
+        <option value="simple" ${(DB.meta.capturaTiempo||"simple")==="simple"?"selected":""}>El técnico escribe su tiempo en cada actividad</option>
         <option value="detallado" ${DB.meta.capturaTiempo==="detallado"?"selected":""}>Detallado — el técnico escribe los minutos de cada actividad</option>
       </select></label>
   </div>
@@ -4684,6 +4915,16 @@ function vDatos(){
   <p class="hint" style="margin-top:11px">La estructura se actualiza sola al abrir la app. <b>No necesitas borrar nada</b> cuando llegue una versión nueva: los campos nuevos se agregan vacíos y tus datos siguen intactos.</p>
   </div></div>
 
+  <div class="card"><header><h2>Empezar limpio</h2>
+    <span class="sub mono">${DB.registros.length} registro(s)</span></header><div class="body">
+    <p class="hint" style="margin-top:0">Borra <b>solo los registros de actividad</b>. Se conservan los técnicos con su cuarto,
+    las actividades, las tipologías, los festivos y las ausencias. Antes de borrar se descarga un respaldo automático,
+    así que nada se pierde de verdad.</p>
+    <label class="f" style="max-width:220px"><span>Borrar lo anterior a</span>
+      <input type="date" id="limpDesde" value="${DB.meta.limpiezaDesde||proxLunes()}"></label>
+    <button class="btn danger" id="limpiarRegs">Respaldar y borrar registros</button>
+  </div></div>
+
   <details class="help"><summary style="color:var(--red)">Zona peligrosa</summary><div class="bd">
     <p class="hint">Esto borra órdenes, registros y <b>todos los maestros que has cargado</b>. Solo tiene sentido si quieres partir de cero con los datos de ejemplo.</p>
     <button class="btn danger" id="reset">Borrar todo y empezar de cero</button>
@@ -4757,6 +4998,25 @@ function pDatos(){
     if(!ok) return;
     DB=d; migrar(); await guardar(); toast("Respaldo restaurado"); render();
   };
+  const ld=$("#limpDesde"); if(ld) ld.onchange=e=>{ DB.meta.limpiezaDesde=e.target.value; guardar(); };
+  const lr=$("#limpiarRegs");
+  if(lr) lr.onclick=async()=>{
+    const corte = ($("#limpDesde")||{}).value || proxLunes();
+    const van = DB.registros.filter(r=>r.fecha < corte);
+    if(!van.length){ toast("No hay registros anteriores a esa fecha"); return; }
+    if(!await confirmar("Respaldar y borrar",
+      `Se borran ${van.length} registro(s) anteriores al ${fmtFecha(corte)}.\n\n`
+      +`Se conservan técnicos, cuartos, actividades, tipologías, festivos y ausencias.\n\n`
+      +`Primero se descarga el respaldo.`, "Respaldar y borrar")) return;
+    /* El respaldo sale ANTES de tocar nada: si algo falla, el archivo ya está. */
+    bajar("respaldo_registros_"+hoyISO()+".json", JSON.stringify({fecha:new Date().toISOString(), registros:van}, null, 2));
+    await commit(()=>{
+      DB.registros = DB.registros.filter(r=>r.fecha >= corte);
+      DB.meta.registrosSubidos = "";           /* que el puente reciba la lista nueva */
+      DB.meta.subidaCompletaV2 = false;
+    }, `${van.length} registro(s) archivados`);
+  };
+
   $("#reset").onclick=async()=>{
     if(DB.meta.pin){
       const p=await pedirTexto("Borrar todo","Confirma con la clave de coordinación","","password");
@@ -5270,6 +5530,29 @@ function csvAFilas(txt){
   if(fila.some(x=>x!=="")) filas.push(fila);
   return filas;
 }
+/* Arma la URL del puente con sus parámetros y la clave. */
+function urlPuente(cx, extra){
+  const u = new URL(cx.gsUrl);
+  Object.entries(extra||{}).forEach(([k,v])=>u.searchParams.set(k,v));
+  if(cx.clave) u.searchParams.set("clave", cx.clave);
+  return u.toString();
+}
+
+/* El puente devuelve la hoja tal cual, y en PROGRAMACION la fila 1 está en
+   blanco: los encabezados están en la 2. Se busca la fila que más columnas
+   conocidas reconoce y se descarta todo lo que haya encima. */
+const PISTAS_ENCABEZADO = ["ORDEN","CUARTO","ESTADO","CLIENTE","TIPO","MOTIVO","PIR","FECHA"];
+function recortarEncabezado(filas){
+  if(!filas || filas.length<2) return filas||[];
+  let mejor=0, punta=-1;
+  for(let i=0; i<Math.min(filas.length,12); i++){
+    const txt = filas[i].map(c=>sinTildes(String(c||"")).toUpperCase());
+    const n = PISTAS_ENCABEZADO.filter(p=>txt.some(t=>t.indexOf(p)>=0)).length;
+    if(n>mejor){ mejor=n; punta=i; }
+  }
+  return (punta>0 && mejor>=3) ? filas.slice(punta) : filas;
+}
+
 async function leerFuente(){
   const cx = DB.meta.conexion;
   if(cx.modo==="csv"){
@@ -5278,23 +5561,27 @@ async function leerFuente(){
     if(!r.ok) throw new Error("HTTP "+r.status+" — revisa que la hoja esté publicada");
     return {filas: csvAFilas(await r.text()), registros:null};
   }
-  if(cx.modo==="script"){
+  if(cx.modo==="script" || cx.modo==="panel"){
     if(!cx.gsUrl) throw new Error("Falta la URL del Apps Script");
-    const r = await fetch(cx.gsUrl, {redirect:"follow"});
-    if(!r.ok) throw new Error("HTTP "+r.status+" — revisa la URL del Apps Script en Conexión");
+    /* El puente del Panel atiende varios clientes en el mismo enlace: hay que
+       decirle que quien pregunta es la app, y llevar la clave. */
+    const url = cx.modo==="panel" ? urlPuente(cx, {app:"1"}) : cx.gsUrl;
+    const r = await fetch(url, {redirect:"follow"});
+    if(!r.ok) throw new Error("HTTP "+r.status+" — revisa la URL del puente en Conexión");
     const j = await r.json();
-    if(!j.ok) throw new Error(j.error||"El script respondió con error");
-    return {filas: j.filas||[], registros: j.registros||null, config: j.config||null};
+    if(!j.ok) throw new Error(j.error||"El puente respondió con error");
+    return {filas: recortarEncabezado(j.filas||[]), registros: j.registros||null, config: j.config||null};
   }
   throw new Error("No hay conexión configurada");
 }
 async function empujarConfig(){
   const cx = DB.meta.conexion;
-  if(!cx || cx.modo!=="script" || !cx.gsUrl) return;
+  if(!cx || (cx.modo!=="script" && cx.modo!=="panel") || !cx.gsUrl) return;
   const paq = paqueteMaestros();
   const cuerpoCfg = JSON.stringify({accion:"config", config: paq});
   DB.meta.tamEnvioConfig = cuerpoCfg.length;
-  const rc = await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"},
+  const destinoCfg = cx.modo==="panel" ? urlPuente(cx, {app:"1"}) : cx.gsUrl;
+  const rc = await fetch(destinoCfg, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"},
     body: cuerpoCfg, redirect:"follow"});
   const tc = await rc.text().catch(()=>"");
   DB.meta.ultimaRespuestaConfig = String(tc).slice(0,400);
@@ -5305,7 +5592,7 @@ async function empujarConfig(){
 }
 async function empujarRegistros(todo){
   const cx = DB.meta.conexion;
-  if(cx.modo!=="script" || !cx.gsUrl) return;
+  if((cx.modo!=="script" && cx.modo!=="panel") || !cx.gsUrl) return;
   /* La marca de "subido" se pone SOLO si el envío sale bien (más abajo).
      Ponerla aquí hacía que un fallo de red se diera por bueno y el registro
      no se volviera a intentar nunca. */
@@ -5351,7 +5638,8 @@ async function empujarRegistros(todo){
         motivoAnulacion:r.motivoAnulacion||"", sinOrden:!!r.sinOrden})};
   })});
   /* text/plain evita el preflight CORS que Apps Script no responde */
-  const r = await fetch(cx.gsUrl, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:cuerpo, redirect:"follow"});
+  const destino = cx.modo==="panel" ? urlPuente(cx, {app:"1"}) : cx.gsUrl;
+  const r = await fetch(destino, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:cuerpo, redirect:"follow"});
   if(!r.ok) throw new Error("HTTP "+r.status+" al subir los registros");
   /* El puente responde 200 aunque falle, con el motivo dentro. Antes se
      ignoraba y el error quedaba invisible. */
@@ -5545,8 +5833,25 @@ function programarSync(){
   /* Separación aleatoria: si los 20 equipos sincronizan en el mismo segundo,
      el Apps Script se satura. Cada uno arranca con un desfase propio. */
   if(cx.modo && cx.autoMin>0){
-    const base=cx.autoMin*60000, jitter=Math.floor(Math.random()*90000);
+    /* El coordinador consulta, no registra: necesita ver lo último y son pocos
+       equipos. El técnico registra desde su celular y son muchos, así que se
+       le deja el ritmo normal para no agotar la cuota de Apps Script. */
+    const minutos = esCoordinador() ? Math.min(cx.autoMin, 2) : cx.autoMin;
+    const base=minutos*60000, jitter=Math.floor(Math.random()*90000);
     SYNC.timer=setInterval(()=>sincronizar(true), base+jitter);
+  }
+  /* Al volver a la pestaña o desbloquear el celular, traer lo último de una vez.
+     Es el momento en que alguien QUIERE ver los datos frescos: esperar al
+     siguiente turno del reloj es justo lo que hacía sentir la app desactualizada. */
+  if(!SYNC.alVolver){
+    SYNC.alVolver = true;
+    document.addEventListener("visibilitychange", ()=>{
+      if(document.visibilityState!=="visible") return;
+      const c=DB.meta.conexion; if(!c || !c.modo) return;
+      const ult = c.ultimaSync ? Date.parse(c.ultimaSync) : 0;
+      if(Date.now()-ult > 45000) sincronizar(true);   /* sin martillar al puente */
+    });
+    window.addEventListener("online", ()=>{ if(DB.meta.conexion && DB.meta.conexion.modo) sincronizar(true); });
   }
   clearInterval(SYNC.timerVer);
   SYNC.timerVer=setInterval(revisarVersion, 15*60000);
@@ -5734,11 +6039,25 @@ function vConexion(){
         </tbody></table></div>`:""}
       <div class="seg" style="margin-bottom:14px">
         <button data-modo="" class="${cx.modo===""?"on":""}">Manual</button>
+        <button data-modo="panel" class="${cx.modo==="panel"?"on":""}">Puente del Panel</button>
         <button data-modo="csv" class="${cx.modo==="csv"?"on":""}">Hoja publicada</button>
-        <button data-modo="script" class="${cx.modo==="script"?"on":""}">Puente Apps Script</button>
+        <button data-modo="script" class="${cx.modo==="script"?"on":""}">Puente propio</button>
       </div>
 
       ${cx.modo===""?`<p class="hint">Sin conexión: las órdenes entran copiando y pegando desde la pestaña Datos.</p>`:""}
+
+      ${cx.modo==="panel"?`
+        <div style="border:1px solid #b6ddc6;background:#eaf6ef;padding:10px 12px;border-radius:var(--r);margin-bottom:12px;font-size:13.5px;color:var(--green)">
+          <b>El mismo enlace del Panel de indicadores.</b> Uno solo para todo: las órdenes bajan de PROGRAMACION
+          y los registros de los técnicos se comparten entre todos los dispositivos.
+          Los registros se guardan en pestañas aparte (<span class="mono">APP_REGISTROS</span> y
+          <span class="mono">APP_CONFIG</span>); <b>PROGRAMACION nunca se escribe</b>.</div>
+        <label class="f"><span>Enlace del puente (termina en /exec)</span>
+          <input type="text" id="cxGs" value="${esc(cx.gsUrl)}" placeholder="https://script.google.com/macros/s/…/exec"></label>
+        <label class="f" style="max-width:240px"><span>Clave</span>
+          <input type="text" id="cxClave" value="${esc(cx.clave||"")}" placeholder="la misma del Codigo.gs"></label>
+        <p class="hint">Si el Panel de indicadores ya te funciona, usa exactamente ese enlace y esa clave.
+        Necesitas el <b>Codigo.gs</b> actualizado: el anterior solo sabe entregar órdenes, no guardar registros.</p>`:""}
 
       ${cx.modo==="csv"?`
         <ol style="margin:0 0 14px 18px;padding:0;font-size:13.5px;color:var(--ink-2)">
@@ -5798,7 +6117,8 @@ function pConexion(){
   });
   const g=$("#cxGuardar");
   if(g) g.onclick=async()=>{
-    const csv=$("#cxCsv"), gs=$("#cxGs"), au=$("#cxAuto");
+    const csv=$("#cxCsv"), gs=$("#cxGs"), au=$("#cxAuto"), cl=$("#cxClave");
+    if(cl) cx.clave = cl.value.trim();
     await commit(()=>{
       if(csv) DB.meta.conexion.csvUrl=csv.value.trim();
       if(gs) DB.meta.conexion.gsUrl=gs.value.trim();
@@ -6172,9 +6492,17 @@ async function configDesdeEnlace(){
     if(!u) return false;
     u=decodeURIComponent(u).trim();
     if(!/^https:\/\/script\.google\.com\//.test(u)) return false;
-    if(DB.meta.conexion.gsUrl===u && DB.meta.conexion.modo==="script") return false;
-    DB.meta.conexion.modo="script";
+    /* El enlace puede traer también la clave y decir de qué puente se trata:
+         ?p=URL&clave=XXXX&modo=panel
+       Así un técnico abre un solo enlace y queda conectado sin escribir nada. */
+    const clave = (q.get("clave")||q.get("k")||"").trim();
+    const modo  = (q.get("modo")||"").trim()==="panel" ? "panel"
+                : (clave ? "panel" : "script");   /* si hay clave, es el puente del Panel */
+    if(DB.meta.conexion.gsUrl===u && DB.meta.conexion.modo===modo
+       && (DB.meta.conexion.clave||"")===clave) return false;
+    DB.meta.conexion.modo=modo;
     DB.meta.conexion.gsUrl=u;
+    if(clave) DB.meta.conexion.clave=clave;
     await guardar();
     return true;
   }catch(e){ return false; }

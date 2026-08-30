@@ -680,10 +680,43 @@ function tipologiasDe(tipoComponenteId){
 }
 /* Una tipología puede escribirse de varias formas en la hoja:
    "VE", "PERKINS VE", "BOMBA VE" son la misma bomba rotativa. */
+/* Reconoce la tipología DENTRO del texto, no solo cuando es idéntico.
+   La hoja trae "ATEGO K16", "CAT C15" o "BOMBA VE": son el turbo K16, el motor
+   C15 y la rotativa VE. Con coincidencia exacta ninguna de las tres se
+   encontraba y la orden quedaba sin clasificar. */
+function escaparRe(t){ return String(t).replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
+function clavesTipologia(t){
+  return [t.nombre].concat(String(t.alias||"").split(/[,;|]/))
+    .map(x=>sinTildes(x).trim().toUpperCase()).filter(Boolean);
+}
+function palabraDentro(texto, clave){
+  if(!clave) return false;
+  return new RegExp("(^|[^A-Z0-9])"+escaparRe(clave)+"($|[^A-Z0-9])").test(texto);
+}
 function coincideTipologia(t, texto){
-  const x=sinTildes(texto).trim(); if(!x) return false;
-  if(sinTildes(t.nombre).trim()===x) return true;
-  return String(t.alias||"").split(/[,;|]/).map(a=>sinTildes(a).trim()).filter(Boolean).indexOf(x)>=0;
+  const x=sinTildes(texto).trim().toUpperCase(); if(!x) return false;
+  return clavesTipologia(t).some(k=>palabraDentro(x,k));
+}
+/* Entre varias que coinciden gana la más específica, no la más larga.
+   En "ATEGO K16" están las dos: ATEGO es el vehículo y K16 el turbo. El dato
+   que sirve es el turbo, aunque su nombre sea más corto.
+   Orden de mando: la que aplica a UN componente concreto (K16 → turbo) manda
+   sobre la que aplica a un cuarto entero (Atego → electrónico), y esa manda
+   sobre la que aplica a todo el laboratorio. A igual rango, la palabra más
+   larga: "CAT C15" antes que "C15". */
+function masEspecifica(lista, texto){
+  const x=sinTildes(texto).trim().toUpperCase();
+  let mejor=null, mejorRango=-1, mejorLargo=-1;
+  lista.forEach(t=>{
+    const rango = t.tipoComponenteId ? 2 : (t.cuartoId ? 1 : 0);
+    clavesTipologia(t).forEach(k=>{
+      if(!palabraDentro(x,k)) return;
+      if(rango>mejorRango || (rango===mejorRango && k.length>mejorLargo)){
+        mejorRango=rango; mejorLargo=k.length; mejor=t;
+      }
+    });
+  });
+  return mejor;
 }
 function tipologiasOtras(tipoComponenteId){
   const sug=new Set(tipologiasDe(tipoComponenteId).map(t=>t.id));
@@ -691,8 +724,8 @@ function tipologiasOtras(tipoComponenteId){
 }
 /* Busca por nombre: primero entre las sugeridas, luego en todas. */
 function buscarTipologia(tipoComponenteId, nombre){
-  return tipologiasDe(tipoComponenteId).find(x=>coincideTipologia(x,nombre))
-      || DB.tipologias.find(x=>coincideTipologia(x,nombre))
+  return masEspecifica(tipologiasDe(tipoComponenteId), nombre)
+      || masEspecifica(DB.tipologias, nombre)
       || null;
 }
 function cuartoDeTipologia(t){
@@ -901,6 +934,108 @@ function cuartoPorNombre(nombre){
    1. Que pertenezca al cuarto declarado en la OT  (BOMBAS -> PLD si dice Unitario)
    2. Que alguna tipología de la celda TIPO le calce
    3. El que estaba mapeado en la columna                                        */
+
+/* =========================================================================
+   DICCIONARIO TÉCNICO
+   Es el mismo que quedó afinado en el Panel de indicadores. Se agrega lo que
+   falte SIN tocar lo que ya exista: si coordinación editó una tipología a
+   mano, su versión manda.
+   Tres decisiones que costaron encontrar y conviene no deshacer:
+     · B7  -> cuarto Electrónico. Su bomba NO es de alta rotativa: el D7E crea
+              la presión con dos bombas unitarias movidas por el árbol de levas.
+     · STH -> inyector mecánico, pero hoy lo atiende el cuarto Unitario.
+              El cuarto y la tecnología son cosas distintas.
+     · K05 -> bomba de alta Continental, no un turbo BorgWarner.
+   ========================================================================= */
+var TIPOLOGIAS_BASE = [
+  /* --- Common Rail · cuarto Electrónico --- */
+  ["tp_b7","B7","cu_elec","","volvo b7, d7e, b7r"],
+  ["tp_isl","ISL","cu_elec","","cummins isl"],
+  ["tp_ism","ISM","cu_elec","","cummins ism"],
+  ["tp_isc","ISC","cu_elec","","cummins isc"],
+  ["tp_qsb","QSB","cu_elec","","cummins qsb"],
+  ["tp_scania","Scania XPI","cu_elec","","scania, xpi"],
+  ["tp_npr","NPR","cu_elec","",""],
+  ["tp_nkr","NKR","cu_elec","",""],
+  ["tp_sprinter","Sprinter","cu_elec","","mercedes sprinter, mercedez sprinter"],
+  ["tp_constellation","VW Constellation","cu_elec","","constellation, costelation, wolkswagen"],
+  ["tp_atego","Atego","cu_elec","","mercedes atego"],
+  ["tp_canter","Canter","cu_elec","","mitsubishi canter"],
+  ["tp_fuso","Fuso","cu_elec","",""],
+  ["tp_sedona","Sedona","cu_elec","","kia sedona"],
+  ["tp_sportage","Sportage","cu_elec","",""],
+  ["tp_np300","NP300","cu_elec","","nissan np300"],
+  ["tp_master","Master","cu_elec","","renault master"],
+  ["tp_crdi","CRDi","cu_elec","","crdi"],
+  ["tp_jac","JAC","cu_elec","",""],
+  ["tp_foton","Foton","cu_elec","",""],
+  ["tp_hd","Hyundai HD","cu_elec","","hyundai"],
+  /* --- Inyectores Common Rail --- */
+  ["tp_crin","CRIN","","tc_iny_cr","bosch crin"],
+  ["tp_cri","CRI","","tc_iny_cr","bosch cri"],
+  ["tp_piezo","Piezoeléctrico","","tc_iny_cr","piezo, piezoelectrico, bosch piezo"],
+  /* --- Bombas de alta presión --- */
+  ["tp_cp1","CP1","","tc_bomba_alta","bosch cp1"],
+  ["tp_cpn6","CPN6","","tc_bomba_alta","cpn6c2, cpn5, cpn2"],
+  ["tp_cpm","CPM","","tc_bomba_alta",""],
+  ["tp_hp0","HP0","","tc_bomba_alta","denso hp0"],
+  ["tp_hp3","HP3","","tc_bomba_alta","denso hp3, chp3"],
+  ["tp_hp4","HP4","","tc_bomba_alta","denso hp4"],
+  ["tp_k05","Continental K05","","tc_bomba_alta","k05, continental"],
+  ["tp_denso","Denso","","tc_bomba_alta",""],
+  /* --- Bomba electrónica EDC --- */
+  ["tp_vp44","VP44","","tc_edc","bosch vp44"],
+  ["tp_vp30","VP30","","tc_edc","vp37"],
+  /* --- Unitario --- */
+  ["tp_sth","STH","cu_unit","","bomba inyector sth"],
+  ["tp_pld","PLD","cu_unit","","mercedes pld"],
+  ["tp_b12","B12","cu_unit","","volvo b12"],
+  ["tp_e3","Detroit E3","cu_unit","","e3, serie 60"],
+  ["tp_c15","CAT C15","cu_unit","","c15, caterpillar c15"],
+  ["tp_lorange","L'Orange","cu_unit","","lorange"],
+  /* --- Mecánico --- */
+  ["tp_lapiz","Inyector lápiz","","tc_iny_mec","lapiz"],
+  ["tp_6bt","Cummins 6BT","cu_mec","","6bt, 4bt"],
+  ["tp_deutz","Deutz","cu_mec","",""],
+  ["tp_kubota","Kubota","cu_mec","",""],
+  ["tp_johndeere","John Deere","cu_mec","","john deere"],
+  ["tp_komatsu","Komatsu","cu_mec","",""],
+  ["tp_td42","Nissan TD42","cu_mec","","td42"],
+  /* --- Turbos --- */
+  ["tp_k03","K03","","tc_turbo","k03 citroen"],
+  ["tp_k04","K04","","tc_turbo",""],
+  ["tp_k24","K24","","tc_turbo",""],
+  ["tp_k26","K26","","tc_turbo",""],
+  ["tp_k27","K27","","tc_turbo",""],
+  ["tp_s200","S200","","tc_turbo",""],
+  ["tp_s300","S300","","tc_turbo",""],
+  ["tp_s400","S400","","tc_turbo",""],
+  ["tp_hx25","HX25","","tc_turbo",""],
+  ["tp_hx40","HX40","","tc_turbo",""],
+  ["tp_he","Holset HE","","tc_turbo","he200, he300, he400"],
+  ["tp_gt22","GT22","","tc_turbo",""],
+  ["tp_td03","TD03","","tc_turbo",""],
+  ["tp_td04","TD04","","tc_turbo",""],
+  ["tp_td05","TD05","","tc_turbo",""],
+  ["tp_ihi","IHI","","tc_turbo",""],
+  ["tp_borg","BorgWarner","","tc_turbo","borg warner, borgwarner"],
+  ["tp_garrett","Garrett","","tc_turbo",""],
+  ["tp_holset","Holset","","tc_turbo",""]
+];
+
+/* Agrega al catálogo lo que falte. Nunca sobrescribe: si ya existe una
+   tipología con ese id, se respeta tal como esté. */
+function sembrarTipologias(){
+  const hay = new Set(DB.tipologias.map(t=>t.id));
+  let n=0;
+  TIPOLOGIAS_BASE.forEach(([id,nombre,cuartoId,tipoComponenteId,alias])=>{
+    if(hay.has(id)) return;
+    DB.tipologias.push({id, nombre, cuartoId:cuartoId||"", tipoComponenteId:tipoComponenteId||"", alias:alias||""});
+    n++;
+  });
+  return n;
+}
+
 /* =========================================================================
    REGLAS DE DESGLOSE
    La hoja de bodega tiene UNA columna para bombas, pero al laboratorio no
@@ -1059,6 +1194,9 @@ function migrar(){
   if(!DB.meta.conexion){ DB.meta.conexion={modo:"",csvUrl:"",gsUrl:"",autoMin:10,mapa:null,desdeFecha:"",ultimaSync:"",ultimoError:""}; n++; }
   if(DB.meta.conexion.desdeFecha===undefined){ DB.meta.conexion.desdeFecha=""; n++; }
   if(DB.meta.conexion.clave===undefined){ DB.meta.conexion.clave=""; n++; }
+  /* El diccionario técnico crece con el tiempo: cada vez que llega una versión
+     nueva se agregan las tipologías que falten, sin tocar las que ya están. */
+  n += sembrarTipologias();
   if(!DB.meta.conexion.sinFecha){ DB.meta.conexion.sinFecha="omitir"; n++; }
   if(DB.meta.jornadaMin!==undefined){ delete DB.meta.jornadaMin; n++; }
   if(!DB.meta.capturaTiempo){ DB.meta.capturaTiempo="simple"; n++; }

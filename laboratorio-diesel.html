@@ -2314,7 +2314,8 @@ function pasoActividades(){
               <label><span>Tiempo que gastaste</span>
                 <div style="display:flex;gap:6px">
                   <input type="number" min="0" step="${uni==="h"?"0.25":"5"}" inputmode="decimal"
-                         data-tiempo="${a.id}" value="${valor}" placeholder="0" style="flex:1 1 auto">
+                         data-tiempo="${a.id}" value="${valor}" placeholder="${uni==="h"?"0.5":"30"}"
+                         style="flex:1 1 auto${(s && !(+s.minutos||0))?";border-color:var(--signal);background:#fdefe5":""}">
                   <select data-unidad="${a.id}" style="flex:0 0 90px">
                     <option value="min" ${uni==="min"?"selected":""}>minutos</option>
                     <option value="h" ${uni==="h"?"selected":""}>horas</option>
@@ -2388,11 +2389,38 @@ function revisarTope(){
   return false;
 }
 
+/* Refresca solo la barra inferior: el resumen y el botón Siguiente.
+   Se usa mientras el técnico escribe, para no perder el foco del campo. */
+function actualizarBarra(){
+  const cont = document.querySelector(".fixbar");
+  if(!cont || !cont.parentNode) return;
+  const tmp = document.createElement("div");
+  tmp.innerHTML = barraRegistro();
+  const nueva = tmp.firstElementChild;
+  if(nueva){
+    cont.parentNode.replaceChild(nueva, cont);
+    const b = document.querySelector("#siguiente");
+    if(b) b.onclick = async()=>{ if(R.paso===2 && !revisarTope()) return; R.paso++; render(); };
+    const a = document.querySelector("#atras");
+    if(a) a.onclick = ()=>{ R.paso--; render(); };
+    const g = document.querySelector("#guardarReg");
+    if(g) g.onclick = guardarRegistro;
+  }
+}
+
 function barraRegistro(){
   const totalMin = Object.values(R.sel).reduce((a,s)=>a+(+s.minutos||0),0);
-  const listo = R.paso===1 ? !!R.ordenId : R.paso===2 ? Object.keys(R.sel).length>0 : true;
+  /* En el paso 2 no basta con marcar la actividad: hay que decir cuánto tomó.
+     Un registro sin tiempo no sirve para nada y ensucia todos los promedios,
+     así que el botón no se habilita hasta que todas tengan su número. */
+  const marcadas = Object.entries(R.sel);
+  const faltaTiempo = marcadas.filter(([,x])=>!(+x.minutos||0)).length;
+  const listo = R.paso===1 ? !!R.ordenId
+              : R.paso===2 ? (marcadas.length>0 && faltaTiempo===0)
+              : true;
   return `<div class="fixbar"><div class="in">
-    <div class="sum">${Object.keys(R.sel).length} actividad(es)<br>${hrs(totalMin)} h · ${fmtFecha(R.fecha)}</div>
+    <div class="sum">${marcadas.length} actividad(es)<br>${hrs(totalMin)} h · ${fmtFecha(R.fecha)}
+      ${R.paso===2&&faltaTiempo?`<br><span style="color:var(--signal)">falta el tiempo en ${faltaTiempo}</span>`:""}</div>
     <div class="sp"></div>
     ${R.paso>1?`<button class="btn" id="atras">Atrás</button>`:""}
     ${R.paso<3?`<button class="btn primary" id="siguiente" ${listo?"":"disabled"}>Siguiente</button>`
@@ -2473,6 +2501,12 @@ function pRegistro(){
     const uni=(R.sel[id].unidad)||R.unidad||"min";
     const v=parseFloat(String(i.value).replace(",","."))||0;
     R.sel[id].minutos = uni==="h" ? Math.round(v*60) : Math.round(v);
+    /* El aviso se apaga en cuanto escribe, sin redibujar toda la pantalla:
+       repintar mientras teclea le quitaría el cursor del campo. */
+    const falta = !R.sel[id].minutos;
+    i.style.borderColor = falta ? "var(--signal)" : "";
+    i.style.background  = falta ? "#fdefe5" : "";
+    actualizarBarra();
   });
   document.querySelectorAll("[data-unidad]").forEach(sel=>sel.onchange=()=>{
     const id=sel.dataset.unidad; if(!R.sel[id]) return;

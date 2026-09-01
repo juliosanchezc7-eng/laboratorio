@@ -856,8 +856,16 @@ function avancePeriodo(desde, hasta, cuartoId, tecnicoId){
   const avanzaron = [], quietas = [];
   const porTecnico = {};
 
+  const cerr = cerrados();
   DB.componentes.forEach(c=>{
     if(cuartoId && c.cuartoId!==cuartoId) return;
+    const ord = byId(DB.ordenes, c.ordenId);
+    /* La hoja manda. Si PROGRAMACION dice que la orden ya salió —entregada,
+       dada de baja o no autorizada— la pieza no está detenida: está afuera.
+       Antes se miraba solo lo que los técnicos habían registrado, y una orden
+       entregada seguía apareciendo como atascada porque nadie le registró la
+       actividad de entrega. */
+    const salio = !ord || cerr.has(ord.estado) || /no autoriz|dado de baja/i.test(ord.estado||"");
     const nAntes = faseAlcanzada(c.id, antes);
     const nAhora = faseAlcanzada(c.id, hasta);
     const regs = RA().filter(r=>r.componenteId===c.id && r.fecha>=desde && r.fecha<=hasta);
@@ -873,8 +881,9 @@ function avancePeriodo(desde, hasta, cuartoId, tecnicoId){
           porTecnico[r.tecnicoId].piezas += +c.cantidad||0;
         }
       });
-    } else if(nAhora < 4 && nAhora > 0 && !regs.length){
-      /* Empezada, sin terminar y sin movimiento en el periodo. */
+    } else if(!salio && nAhora < 4 && nAhora > 0 && !regs.length){
+      /* Empezada, sin terminar, sin movimiento en el periodo y con la orden
+         todavía abierta según la hoja. */
       const ult = RA().filter(r=>r.componenteId===c.id)
         .reduce((m,r)=>r.fecha>m?r.fecha:m, "");
       /* Una fecha de registro fuera de rango —un año mal tecleado— produce
@@ -3730,18 +3739,22 @@ function vSemanal(){
     <div class="card"><header><h2>3 · Qué está detenido</h2>
       <span class="sub">empezado y sin moverse en el periodo</span></header><div class="body">
       ${av.quietas.length?`<div class="tw" style="max-height:340px;overflow:auto"><table>
-        <thead><tr><th>OT</th><th>Componente</th><th class="num">Piezas</th><th>Se quedó en</th><th class="num">Días</th></tr></thead>
+        <thead><tr><th>OT</th><th>Componente</th><th class="num">Piezas</th><th>Se quedó en</th><th>Estado en la hoja</th><th class="num">Días</th></tr></thead>
         <tbody>${av.quietas.slice(0,40).map(x=>`<tr>
           <td class="mono">${esc(x.o?x.o.ot:"—")}</td>
           <td>${esc(nom(DB.tiposComponente,x.c.tipoComponenteId))}</td>
           <td class="num">${x.c.cantidad}</td>
           <td class="tag">${NOMBRE_FASE[x.fase]}</td>
+          <td>${x.o&&x.o.estado?`<span class="tag">${esc(x.o.estado)}</span>`:"—"}</td>
           <td class="num">${x.dias==null
             ? (x.fechaRara?`<span class="chip c-naranja" title="El registro tiene una fecha imposible: ${esc(x.desde)}">fecha mal escrita</span>`:"—")
             : `<span class="chip ${x.dias>15?"c-naranja":x.dias>7?"c-ambar":""}">${x.dias}</span>`}</td></tr>`).join("")}
         </tbody></table></div>
-        <p class="hint" style="margin-top:9px">Una pieza que lleva días en la misma fase no siempre es culpa del técnico:
-        puede estar esperando repuesto o autorización. Pero si nadie la mira, tampoco se entera nadie.</p>`
+        <p class="hint" style="margin-top:9px">Solo aparecen órdenes que <b>siguen abiertas según PROGRAMACION</b>.
+        Si la hoja dice Entregado, Dado de baja o No autorizado, la pieza ya salió del laboratorio y no está detenida,
+        aunque nadie le haya registrado la actividad de entrega.<br>
+        La columna <b>Estado en la hoja</b> suele explicar la demora: casi todo lo que lleva más de quince días
+        está en Pendiente autorización o Pendiente repuestos. Eso no lo resuelve el técnico.</p>`
         :`<div style="border:1px solid #b6ddc6;background:#eaf6ef;color:var(--green);padding:10px 12px;border-radius:var(--r);font-size:13.5px"><b>Nada detenido.</b> Todo lo empezado se movió en el periodo.</div>`}
     </div></div>
   </div>

@@ -877,8 +877,14 @@ function avancePeriodo(desde, hasta, cuartoId, tecnicoId){
       /* Empezada, sin terminar y sin movimiento en el periodo. */
       const ult = RA().filter(r=>r.componenteId===c.id)
         .reduce((m,r)=>r.fecha>m?r.fecha:m, "");
+      /* Una fecha de registro fuera de rango —un año mal tecleado— produce
+         miles de días de antigüedad y arruina el orden de la lista. Se marca
+         como sospechosa en vez de creerle. */
+      const sano = ult && ult >= "2026-01-01" && ult <= hasta;
       quietas.push({c, o:byId(DB.ordenes,c.ordenId), fase:nAhora, desde:ult,
-        dias: ult? Math.max(0, Math.round((new Date(hasta+"T12:00:00")-new Date(ult+"T12:00:00"))/86400000)) : null});
+        piezas: +c.cantidad||0,
+        fechaRara: !!(ult && !sano),
+        dias: sano ? Math.max(0, Math.round((new Date(hasta+"T12:00:00")-new Date(ult+"T12:00:00"))/86400000)) : null});
     }
   });
 
@@ -2172,7 +2178,7 @@ function pasoOrden(){
     </header>
     <div class="body">
       <label class="f"><span>Fecha del registro</span>
-        <input type="date" id="fechaReg" value="${R.fecha}" max="${hoyISO()}" ${minFecha?`min="${minFecha}"`:""}></label>
+        <input type="date" id="fechaReg" value="${R.fecha}" max="${hoyISO()}" min="${minFecha||"2026-01-01"}"></label>
       ${minFecha&&R.fecha<minFecha?`<p class="hint" style="color:var(--signal);margin-top:-6px">Solo puedes registrar hasta ${DB.meta.diasRetro} día(s) atrás. Para fechas anteriores, pídeselo a coordinación.</p>`:""}
       ${esCoordinador()?`<label class="f"><span>Registrar a nombre de</span>
         <select id="regTecnico">
@@ -3668,21 +3674,38 @@ function vSemanal(){
       <button class="btn primary sm" id="imprimir">Imprimir / PDF</button></div>
   </div><p class="hint">Imprime a PDF y tienes la presentación semanal lista. Cada bloque es una diapositiva.</p></div></div>
 
-  <div class="card"><header><h2>Producción del laboratorio</h2><span class="sub mono">${fmtFecha(d)} → ${fmtFecha(h)}</span></header>
+  <div class="card"><header>
+      <h2>1 · El flujo del laboratorio</h2>
+      <span class="sub mono">${fmtFecha(d)} → ${fmtFecha(h)}</span></header>
     <div class="body">
+      <p class="hint" style="margin-top:0">Cómo se movió el trabajo. Estas cifras son del laboratorio, no de una persona:
+      una orden sale cuando llega el repuesto y el cliente autoriza, no solo cuando el técnico termina.</p>
       <div class="kpis">
-        <div class="kpi"><div class="l">Horas productivas</div><div class="v">${hrs(real)}</div><div class="h">de ${hrs(cap)} h disponibles</div>
-          <div class="gauge"><i class="${ocup>=85?"ok":ocup>=60?"warn":"bad"}" style="width:${Math.min(100,ocup)}%"></i></div></div>
-        <div class="kpi"><div class="l">Ocupación</div><div class="v">${ocup}%</div><div class="h">${activos.length} técnicos · ${hrs(capDia)} h c/u${minNoProd?` · ${hrs(minNoProd)} h no productivas`:""}</div></div>
+        <div class="kpi"><div class="l">Piezas que avanzaron</div><div class="v">${av.avanzaron.reduce((a,x)=>a+x.piezas,0)}</div>
+          <div class="h">${av.avanzaron.length} componente(s) subieron de fase</div></div>
         <div class="kpi"><div class="l">Piezas tocadas</div><div class="v">${piezasSemana}</div>
-          <div class="h">${new Set(rs.map(r=>r.ordenId)).size} órdenes tocadas</div></div>
+          <div class="h">en ${new Set(rs.map(r=>r.ordenId)).size} órdenes</div></div>
         <div class="kpi"><div class="l">OT entregadas</div><div class="v">${entregadas}</div>
-          <div class="h">${salieronSinReparar?`${salieronSinReparar} salieron sin repararse`:"en el periodo"}</div></div>
+          <div class="h">${(()=>{
+            const viejas = DB.ordenes.filter(o=>o.vigente!==false && /entregad/i.test(o.estado||"")
+              && (o.fechaEntrega||o.fechaIngreso) >= d && (o.fechaEntrega||o.fechaIngreso) <= h
+              && o.fechaIngreso && o.fechaIngreso < d).length;
+            return viejas ? `${viejas} venían de antes del periodo` : "en el periodo";
+          })()}</div></div>
+        <div class="kpi ${av.quietas.length?"alert":""}"><div class="l">Piezas quietas</div>
+          <div class="v">${av.quietas.reduce((a,x)=>a+(+x.piezas||0),0)}</div>
+          <div class="h">${(()=>{
+            if(!av.quietas.length) return "nada atascado";
+            const conDias = av.quietas.filter(x=>x.dias!=null);
+            return conDias.length ? `la más vieja lleva ${conDias[0].dias} día(s)`
+                                  : `${av.quietas.length} componente(s) sin movimiento`;
+          })()}</div></div>
       </div>
+      ${salieronSinReparar?`<p class="hint" style="margin:9px 0 0">Además, <b>${salieronSinReparar}</b> orden(es) salieron sin repararse: dadas de baja o no autorizadas.</p>`:""}
     </div></div>
 
   <div class="grid g2" style="margin-bottom:14px">
-    <div class="card"><header><h2>Qué avanzó</h2>
+    <div class="card"><header><h2>2 · Qué se movió</h2>
       <span class="sub">piezas que subieron de fase en el periodo</span></header><div class="body">
       <p class="hint" style="margin-top:0">El tiempo dice cuánto se gastó; esto dice qué se logró.
       Para que una pieza pase de Diagnóstico a Reparación hay que haber hecho el trabajo, y la cantidad
@@ -3704,7 +3727,7 @@ function vSemanal(){
             <div class="n">${x.piezas} pza · ${x.comps.size} comp.</div></div>`).join("")}</div>`:""}
     </div></div>
 
-    <div class="card"><header><h2>Qué está quieto</h2>
+    <div class="card"><header><h2>3 · Qué está detenido</h2>
       <span class="sub">empezado y sin moverse en el periodo</span></header><div class="body">
       ${av.quietas.length?`<div class="tw" style="max-height:340px;overflow:auto"><table>
         <thead><tr><th>OT</th><th>Componente</th><th class="num">Piezas</th><th>Se quedó en</th><th class="num">Días</th></tr></thead>
@@ -3713,7 +3736,9 @@ function vSemanal(){
           <td>${esc(nom(DB.tiposComponente,x.c.tipoComponenteId))}</td>
           <td class="num">${x.c.cantidad}</td>
           <td class="tag">${NOMBRE_FASE[x.fase]}</td>
-          <td class="num">${x.dias==null?"—":`<span class="chip ${x.dias>15?"c-naranja":x.dias>7?"c-ambar":""}">${x.dias}</span>`}</td></tr>`).join("")}
+          <td class="num">${x.dias==null
+            ? (x.fechaRara?`<span class="chip c-naranja" title="El registro tiene una fecha imposible: ${esc(x.desde)}">fecha mal escrita</span>`:"—")
+            : `<span class="chip ${x.dias>15?"c-naranja":x.dias>7?"c-ambar":""}">${x.dias}</span>`}</td></tr>`).join("")}
         </tbody></table></div>
         <p class="hint" style="margin-top:9px">Una pieza que lleva días en la misma fase no siempre es culpa del técnico:
         puede estar esperando repuesto o autorización. Pero si nadie la mira, tampoco se entera nadie.</p>`
@@ -3721,9 +3746,13 @@ function vSemanal(){
     </div></div>
   </div>
 
-  <div class="card"><header><h2>Qué hizo cada técnico</h2>
-    <span class="sub">el tiempo lo declara él; las unidades las topa la orden</span></header><div class="body">
+  <div class="card"><header><h2>4 · Qué hizo cada técnico</h2>
+    <span class="sub">lo que movió, no lo que declaró</span></header><div class="body">
     <p class="hint" style="margin-top:0">
+      <b>Piezas que movió</b> es la primera columna a propósito: son las que subieron de fase gracias a él.
+      Es lo único que no se puede escribir sin haberlo hecho — la cantidad la topa PROGRAMACION y una fase
+      se alcanza o no se alcanza. Alguien puede declarar sus ocho horas; no puede declarar que una bomba
+      pasó a reparación si no la reparó.<br>
       <b>Ritmo</b> compara sus minutos por unidad contra la mediana de sus compañeros en la misma actividad
       y el mismo componente. <b>1.00</b> es ir al paso del cuarto; <b>1.40</b> es tardar 40% más.
       No hay tiempo estándar: la referencia sale del propio grupo, así que si todos se demoran más este mes,
@@ -3732,27 +3761,35 @@ function vSemanal(){
       no midiendo: mira ese número antes de leer los demás.
     </p>
     <div class="tw"><table>
-    <thead><tr><th>Técnico</th><th class="num">Directo</th><th class="num">Apoyo</th><th class="num">Sin orden</th><th class="num">No prod.</th><th class="num">Unidades</th><th class="num">Ritmo</th><th class="num">Mismo día</th></tr></thead>
+    <thead><tr><th>Técnico</th><th class="num">Piezas que movió</th><th class="num">Piezas tocadas</th><th class="num">Ritmo</th><th class="num">Mismo día</th><th class="num">Horas</th><th>En qué se fue el tiempo</th></tr></thead>
     <tbody>${activos.map(t=>{
       const rr=rs.filter(r=>r.tecnicoId===t.id);
       const rep=repartoTiempo(rr,t);
       const ri=ritmos[t.id];
       const op=oportunidad(rr);
-      const und=rr.reduce((a,x)=>a+(+x.cantidad||0),0);
+      /* Piezas distintas que tocó, según la hoja. */
+      const suyos=new Set(rr.filter(r=>r.componenteId).map(r=>r.componenteId));
+      let und=0; suyos.forEach(id=>{ const cc=byId(DB.componentes,id); if(cc) und+=+cc.cantidad||0; });
+      /* Piezas que hizo avanzar de fase: el crédito del avance. */
+      const movio=(av.porTecnico[t.id]||{}).piezas||0;
       const tot=rep.directo+rep.apoyo+rep.sinOrden+rep.noProd;
       const barra=(v,color)=>tot?`<div style="height:5px;background:${color};width:${v/tot*100}%"></div>`:"";
       return `<tr><td><b>${esc(t.nombre)}</b><br>
           <div style="display:flex;height:5px;border-radius:3px;overflow:hidden;background:#eef1f3;margin-top:4px;max-width:170px">
             ${barra(rep.directo,"var(--prussian-2)")}${barra(rep.apoyo,"var(--green)")}${barra(rep.sinOrden,"var(--amber)")}${barra(rep.noProd,"#b8c4cd")}</div></td>
-        <td class="num">${rep.directo?hrs(rep.directo):"—"}</td>
-        <td class="num">${rep.apoyo?hrs(rep.apoyo):"—"}</td>
-        <td class="num">${rep.sinOrden?`<span class="chip c-ambar">${hrs(rep.sinOrden)}</span>`:"—"}</td>
-        <td class="num">${rep.noProd?hrs(rep.noProd):"—"}</td>
+        <td class="num" style="font-size:16px;font-weight:600">${movio||"—"}</td>
         <td class="num">${und||"—"}</td>
         <td class="num">${ri&&ri.n>=3
           ? `<span class="chip ${ri.ritmo<=1.15?"c-verde":ri.ritmo<=1.5?"c-ambar":"c-naranja"}" title="${ri.n} trabajos comparables">${ri.ritmo.toFixed(2)}</span>`
           : `<span class="tag" title="${ri?ri.n:0} trabajos comparables · hacen falta 3">sin base</span>`}</td>
-        <td class="num">${op.n?`<span class="chip ${op.pct>=80?"c-verde":op.pct>=50?"c-ambar":"c-naranja"}" title="demora mediana: ${op.demora} día(s)">${op.pct}%</span>`:"—"}</td></tr>`;
+        <td class="num">${op.n?`<span class="chip ${op.pct>=80?"c-verde":op.pct>=50?"c-ambar":"c-naranja"}" title="demora mediana: ${op.demora} día(s)">${op.pct}%</span>`:"—"}</td>
+        <td class="num">${tot?hrs(tot):"—"}</td>
+        <td class="sub" style="font-size:11.5px">${[
+            rep.directo?`${hrs(rep.directo)} directo`:"",
+            rep.apoyo?`${hrs(rep.apoyo)} apoyo`:"",
+            rep.sinOrden?`${hrs(rep.sinOrden)} sin orden`:"",
+            rep.noProd?`${hrs(rep.noProd)} no prod.`:""
+          ].filter(Boolean).join(" · ")||"—"}</td></tr>`;
     }).join("")}</tbody></table></div>
     <div class="cohorte-pie" style="display:flex;gap:15px;flex-wrap:wrap;margin-top:9px;font-size:12px;color:var(--ink-2)">
       <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--prussian-2);margin-right:5px"></i>Directo sobre piezas</span>
@@ -3762,7 +3799,13 @@ function vSemanal(){
     </div>
   </div></div>
 
-  <div class="card"><header><h2>Jornada por técnico</h2></header><div class="body"><div class="tw"><table>
+  <div class="card noprint"><header><h2>Jornada por técnico</h2>
+    <span class="sub">control interno · no es material de reunión</span></header>
+    <div class="body">
+    <p class="hint" style="margin-top:0">Las horas sirven para saber cuánto toma un trabajo y para dimensionar el
+    laboratorio, no para calificar a nadie: el tiempo lo declara cada quien y siempre cabe en la jornada.
+    Esta tarjeta no se imprime.</p>
+    <div class="tw"><table>
     <thead><tr><th>Técnico</th><th>Cuarto</th><th class="num">Horas</th><th class="num">Jornada</th><th class="num">Ausencia</th><th class="num">Extra</th><th class="num">No prod.</th><th class="num">Unidades</th><th class="num">Ocupación</th></tr></thead>
     <tbody>${tec.map(x=>`<tr><td><b>${esc(x.t.nombre)}</b></td><td>${esc(nom(DB.cuartos,x.t.cuartoId))}</td>
       <td class="num">${hrs(x.m)}</td>
@@ -3773,9 +3816,12 @@ function vSemanal(){
       <td class="num">${x.u||"—"}</td>
       <td class="num">${x.oc?`<span class="chip ${x.oc>=90?"c-verde":x.oc>=65?"c-ambar":"c-naranja"}">${x.oc}%</span>`:"—"}</td></tr>`).join("")}
     <tr style="background:#f7f9fa"><td><b>TOTAL</b></td><td></td><td class="num"><b>${hrs(real)}</b></td><td class="num"><b>${hrs(cap)}</b></td><td class="num"><b>${hrs(minutosAusencia(d,h))}</b></td><td class="num"><b>${hrs(tec.reduce((a,x)=>a+x.ex,0))}</b></td><td class="num"><b>${hrs(minNoProd)}</b></td><td class="num"><b>${tec.reduce((a,x)=>a+x.u,0)}</b></td><td class="num"><b>${ocup}%</b></td></tr>
-    </tbody></table></div></div></div>
+    </tbody></table></div></div>
 
-  <div class="card"><header><h2>Novedades y causas de desviación</h2></header><div class="body">
+  </div>
+
+  <div class="card"><header><h2>5 · Por qué no avanzó lo que no avanzó</h2>
+    <span class="sub">novedades que escribieron los técnicos</span></header><div class="body">
     ${Object.keys(novs).length?Object.entries(novs).sort((a,b)=>b[1].length-a[1].length).map(([k,v])=>`
       <div style="margin-bottom:11px"><span class="chip c-naranja">${esc(k)}</span> <b class="mono">${v.length}</b>
       <ul style="margin:5px 0 0 18px;padding:0;font-size:13px;color:var(--ink-2)">
@@ -5145,6 +5191,19 @@ function chequeos(){
      existen: el técnico escribe su propio tiempo. En su lugar se revisa lo que
      sí importa ahora: que las órdenes traigan sus componentes, porque de ahí
      salen las unidades que el técnico no puede inflar. */
+  /* Un año mal tecleado convierte un registro de hoy en uno de 2002 y ese
+     componente aparece con miles de días de antigüedad. Vale la pena atajarlo
+     antes de que ensucie una reunión. */
+  const fechasRaras = RA().filter(r=>{
+    const f = String(r.fecha||"");
+    return f && (f < "2026-01-01" || f > hoyISO());
+  });
+  c.push({critico:true, ok:fechasRaras.length===0, titulo:"Registros con fecha imposible",
+    detalle: fechasRaras.length
+      ? `${fechasRaras.length}: ${fechasRaras.slice(0,3).map(r=>`${nom(DB.tecnicos,r.tecnicoId)} el ${r.fecha}`).join(" · ")}`
+      : "todas las fechas están dentro del rango",
+    donde:"Dashboard → Detalle de registros → Corregir"});
+
   const abiertasSinComp = abiertas.filter(o=>!DB.componentes.some(c=>c.ordenId===o.id));
   c.push({critico:true, ok:abiertasSinComp.length===0, titulo:"Órdenes abiertas con sus componentes",
     detalle: abiertasSinComp.length

@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-04 · v52";
+const VERSION_APP = "2026-09-04 · v53";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -1590,6 +1590,19 @@ function migrar(){
      raro y tenga que forzar una resincronización. */
   DB.componentes.forEach(c=>{
     if(c.tipMezcla && c.tipologiaId){ c.tipologiaId=null; n++; }
+  });
+
+  /* Reparación de un bug real: corregir un registro (o restaurarlo tras
+     anularlo) nunca actualizaba su fecha de cambio, así que empujarRegistros()
+     lo daba por "sin novedad" y no lo volvía a subir — la corrección quedaba
+     visible solo en el equipo donde se hizo, para siempre. Cualquier registro
+     que se editó (tiene editadoEn) pero cuya fecha de cambio quedó vieja o
+     vacía se marca para que la próxima sincronización lo suba sí o sí. */
+  DB.registros.forEach(r=>{
+    if(r.editadoEn && (!r.actualizado || r.actualizado < r.editadoEn)){
+      r.pendienteSubir = true;
+      n++;
+    }
   });
 
   /* Textos de la celda TIPO que no describen ningún componente. Se ignoran al
@@ -7367,7 +7380,9 @@ async function anularRegistro(id){
   },"Registro anulado");
 }
 function restaurarRegistro(id){
-  commit(()=>{ const t=byId(DB.registros,id); if(t){ t.anulado=false; t.motivoAnulacion=""; t.anuladoPor=""; } },"Registro restaurado");
+  commit(()=>{ const t=byId(DB.registros,id); if(t){ t.anulado=false; t.motivoAnulacion=""; t.anuladoPor="";
+    t.actualizado=new Date().toISOString(); } },"Registro restaurado");
+  empujarRegistros().catch(()=>{});
 }
 function modalEditarRegistro(id){
   const r = byId(DB.registros,id); if(!r) return;
@@ -7500,6 +7515,11 @@ function modalEditarRegistro(id){
         if(reasigna) Object.assign(t,reasigna);
         t.historial=(t.historial||[]).concat([{cuando:new Date().toISOString(), quien:YO, motivo, cambios:cambios.join(" · ")}]);
         t.editadoPor=YO; t.editadoEn=new Date().toISOString();
+        /* Sin esto, empujarRegistros() compara la fecha de "última subida
+           exitosa" contra esta y, como no cambiaba, decidía que el registro
+           seguía igual y lo dejaba fuera del envío para siempre: la
+           corrección quedaba visible solo en este equipo. */
+        t.actualizado=new Date().toISOString();
       },"Corrección guardada");
       cerrarModal();
       empujarRegistros().catch(()=>{});

@@ -1134,6 +1134,8 @@ var TIPOLOGIAS_BASE = [
   /* --- Turbos --- */
   ["tp_k16","K16","","tc_turbo","atego k16"],
   ["tp_k03","K03","","tc_turbo","k03 citroen"],
+  ["tp_he351ve","HE351VE","","tc_turbo","he341ve, he221w, he300vg"],
+  ["tp_bv50","BV50","","tc_turbo",""],
   ["tp_k04","K04","","tc_turbo",""],
   ["tp_k24","K24","","tc_turbo",""],
   ["tp_k26","K26","","tc_turbo",""],
@@ -1170,7 +1172,8 @@ var NOMBRE_DE_ID = {
   cu_elec:"Electrónico", cu_unit:"Unitario", cu_mec:"Mecánico", cu_turbo:"Turbos",
   tc_iny_cr:"Inyector Common Rail", tc_bomba_alta:"Bomba de alta presión CR",
   tc_edc:"Bomba electrónica EDC", tc_turbo:"Turbo", tc_iny_mec:"Inyector mecánico",
-  tc_iny_unit:"Inyector unitario", tc_riel:"Riel Common Rail"
+  tc_iny_unit:"Inyector unitario", tc_riel:"Riel Common Rail",
+  tc_bomba_b7:"Bomba B7", tc_bomba_pld:"Bomba PLD"
 };
 
 function sembrarTipologias(){
@@ -1341,6 +1344,17 @@ function limpiezaDeArrastre(){
    Es una costumbre del taller, no una verdad del componente: por eso se
    avisa en vez de darlo por hecho.
    ========================================================================= */
+/* "7 / 6" significa 7 de una tipología y 6 de otra — la convención que ya se
+   usa en PROGRAMACION (ver OT 36588). Sin esto, quitar todo lo que no es
+   dígito convertía "7 / 6" en 76: sumaba las dos cantidades como si fueran
+   una sola cifra. Mismo mecanismo que ya corre en el Panel de indicadores,
+   para que las dos apps lean la hoja exactamente igual. */
+function partirCantidadHoja(raw){
+  const texto = String(raw==null?"":raw).trim();
+  if(!texto) return [];
+  if(texto.indexOf("/")<0) return [parseInt(texto.replace(/[^\d]/g,""),10)||0];
+  return texto.split("/").map(p=>parseInt(String(p).replace(/[^\d]/g,""),10)||0);
+}
 const DESGLOSES = [
   /* En un motor B7 la columna BOMBAS nunca trae bombas de alta presión.
      Son bombas B7, y cuando la cantidad es 3 una de ellas es la de
@@ -1382,13 +1396,24 @@ function desglosarComponente(tipo, cantidad, tipoTexto, cuartoOT){
 }
 function resolverTipo(tipoBase, tokens, usados, cuartoOT){
   const fam=familiaDe(tipoBase.nombre);
+  /* Motores híbridos que traen su propia bomba: si TIPO trae dos motores
+     juntos (ej. "ISB / B7") y la columna BOMBAS llega sin partir en un solo
+     número, ningún token la "reclama" explícitamente y por defecto ganaba el
+     primero que aparece en el texto — casi siempre el motor equivocado.
+     Cuando se busca justo una bomba, se prueba primero el motor que se sabe
+     que trae bomba propia, sin importar en qué orden esté escrito.
+     Real: OT 36588, 2 bombas B7 quedaban asignadas a ISB. */
+  const PRIORIDAD_BOMBA = new Set(["B7"]);
+  const tokens_ = (fam==="bomba")
+    ? tokens.slice().sort((a,b)=>(PRIORIDAD_BOMBA.has(b)?1:0)-(PRIORIDAD_BOMBA.has(a)?1:0))
+    : tokens;
   const familia=[tipoBase].concat(DB.tiposComponente.filter(t=>t.id!==tipoBase.id && familiaDe(t.nombre)===fam));
   const delCuarto = cuartoOT ? familia.filter(t=>t.cuartoId===cuartoOT) : [];
   const pref = delCuarto.length ? delCuarto : familia;
   /* 1) Tipología que TÚ ataste a ese componente: manda sobre todo.
         Así "VE → Bomba rotativa" gana a una tipología suelta creada sola. */
   for(const t of pref){
-    for(const tk of tokens){
+    for(const tk of tokens_){
       if(usados.has(tk)) continue;
       const ok=DB.tipologias.find(x=>x.tipoComponenteId===t.id && coincideTipologia(x,tk));
       if(ok) return {tipo:t, tip:ok, token:tk};
@@ -1396,7 +1421,7 @@ function resolverTipo(tipoBase, tokens, usados, cuartoOT){
   }
   /* 2) Tipología sugerida para ese componente por su cuarto, o libre. */
   for(const t of pref){
-    for(const tk of tokens){
+    for(const tk of tokens_){
       if(usados.has(tk)) continue;
       const ok=tipologiasDe(t.id).find(x=>coincideTipologia(x,tk));
       if(ok) return {tipo:t, tip:ok, token:tk};
@@ -1405,7 +1430,7 @@ function resolverTipo(tipoBase, tokens, usados, cuartoOT){
   /* 3) Solo las tipologías que NO están atadas a otro componente.
         ISB puede cruzar a un turbo; "Lineal" no puede cruzar a un inyector. */
   for(const t of pref){
-    for(const tk of tokens){
+    for(const tk of tokens_){
       if(usados.has(tk)) continue;
       const ok=DB.tipologias.find(x=>!x.tipoComponenteId && coincideTipologia(x,tk));
       if(ok) return {tipo:t, tip:ok, token:tk};
@@ -1414,7 +1439,7 @@ function resolverTipo(tipoBase, tokens, usados, cuartoOT){
   /* Última oportunidad: cualquier tipología cuyo nombre o alias coincida.
      Si el usuario ya dijo "esto es una tipología", debe valer siempre. */
   for(const t of pref){
-    for(const tk of tokens){
+    for(const tk of tokens_){
       if(usados.has(tk)) continue;
       const ok=DB.tipologias.find(x=>coincideTipologia(x,tk));
       if(ok){
@@ -1431,7 +1456,7 @@ function resolverTipo(tipoBase, tokens, usados, cuartoOT){
      ATEGO K16 en Turbos se perdía porque esa tipología estaba sugerida en
      Electrónico. El cuarto SUGIERE el componente, pero no debe borrar el
      nombre del motor. Se acepta cualquier tipología que calce por nombre. */
-  for(const tk of tokens){
+  for(const tk of tokens_){
     if(usados.has(tk)) continue;
     const tp=DB.tipologias.find(x=>coincideTipologia(x,tk));
     if(tp) return {tipo:pref[0]||tipoBase, tip:tp, token:tk};
@@ -1522,6 +1547,30 @@ function migrar(){
   n += repararSemilla();
   if(!DB.meta.limpiezaArrastre){ n += limpiezaDeArrastre(); DB.meta.limpiezaArrastre = true; }
 
+  /* Mientras la columna ESTADO se leyó desplazada (ver sincronizar()), cada
+     nombre de técnico que pasó por esa celda se aprendió como si fuera un
+     estado real de orden. Se retiran los que coinciden exactamente con el
+     nombre de un técnico: ningún estado legítimo de PROGRAMACION puede
+     coincidir con eso. Se corre una sola vez. */
+  if(!DB.meta.limpiezaEstadosPolutos){
+    const nombresTec = new Set(DB.tecnicos.map(t=>sinTildes(t.nombre).trim().toUpperCase()));
+    const antes = DB.estados.length;
+    DB.estados = DB.estados.filter(e=>!nombresTec.has(sinTildes(e).trim().toUpperCase()));
+    n += antes - DB.estados.length;
+    DB.meta.limpiezaEstadosPolutos = true;
+  }
+
+  /* Un componente marcado tipMezcla=true nunca debería tener tipologiaId a la
+     vez — son mutuamente excluyentes por diseño: "mezcla real, no se elige
+     una etiqueta al azar" es justo lo que tipMezcla=true significa. Si esa
+     combinación inválida aparece (por ejemplo, un guardado que quedó a medio
+     camino entre una versión vieja del código y la nueva, por caché del
+     navegador), se corrige sola en vez de esperar a que alguien note el dato
+     raro y tenga que forzar una resincronización. */
+  DB.componentes.forEach(c=>{
+    if(c.tipMezcla && c.tipologiaId){ c.tipologiaId=null; n++; }
+  });
+
   /* Textos de la celda TIPO que no describen ningún componente. Se ignoran al
      leer la hoja para que no nazcan tipologías fantasma como "FILTROS" o un
      número de serie. Si alguno resulta ser real, se quita de esta lista. */
@@ -1547,10 +1596,17 @@ function migrar(){
   })();
 
   /* Tipos de componente que faltaban: sin ellos, las columnas TRANS., REGULA.
-     y MICROFILTROS de la hoja no tenían dónde caer y se ignoraban. */
+     y MICROFILTROS de la hoja no tenían dónde caer y se ignoraban.
+     Bomba B7 y Bomba PLD se agregan como tipos propios, no como variantes de
+     "Bomba de alta presión CR": es lo que hace posible que, cuando TIPO trae
+     dos motores juntos (ISB / B7) y la columna BOMBAS llega sin partir en un
+     solo número, el sistema sepa que esas bombas son del B7, no del primer
+     motor que aparece en el texto. Real: OT 36588, 2 bombas B7 caían en ISB. */
   [{id:"tc_transf",     nombre:"Bomba de transferencia", cuartoId:"cu_elec", tambien:["Transferencia"]},
    {id:"tc_regulador",  nombre:"Regulador de presión",   cuartoId:"cu_elec", tambien:["Regulador"]},
-   {id:"tc_microfiltro",nombre:"Microfiltro",            cuartoId:"cu_elec", tambien:[]}]
+   {id:"tc_microfiltro",nombre:"Microfiltro",            cuartoId:"cu_elec", tambien:[]},
+   {id:"tc_bomba_b7",   nombre:"Bomba B7",               cuartoId:"cu_elec", tambien:[]},
+   {id:"tc_bomba_pld",  nombre:"Bomba PLD",              cuartoId:"cu_unit", tambien:[]}]
   .forEach(t=>{
     /* Se compara por NOMBRE, no por id: la sincronización ya pudo haber creado
        "Transferencia" o "Regulador" con su propio id, y agregarlos otra vez
@@ -2214,12 +2270,19 @@ function pasoOrden(){
         return `<button data-ot="${o.id}" class="${R.ordenId===o.id?"sel":""}">
           <div><div class="ot">OT ${esc(etiquetaOT(o))}</div>
           <div class="meta">${esc(o.cliente||"Sin cliente")} · ingresó ${fmtFecha(o.fechaIngreso)}${cus.length?" · "+cus.map(x=>esc(nom(DB.cuartos,x))).join(" + "):""}</div>
+          ${o.tecnicoHoja?`<div class="meta">Sugerido: <b>${esc(o.tecnicoHoja)}</b>${sinTildes(o.tecnicoHoja).toUpperCase()!==sinTildes(nom(DB.tecnicos,quien)).toUpperCase()?" · cualquiera puede registrarla igual":""}</div>`:""}
+          ${o.novedadHoja?`<div class="meta" style="color:var(--amber)">Novedad: ${esc(o.novedadHoja)}</div>`:""}
           ${(()=>{const h=hermanasDe(o); if(!h.length) return "";
             return `<div class="meta" style="color:var(--muted)">La OT ${esc(otBase(o.ot))} también tiene: ${h.map(x=>esc(x.ot.replace(otBase(x.ot)+"-",""))+" ("+esc(x.estado)+")").join(" · ")}</div>`;})()}
           ${o.revisar?`<div class="meta" style="color:var(--signal)">Falta ubicar: ${esc(o.revisar.join(" / "))}</div>`:""}
           ${(()=>{const h=hermanasDe(o); return h.length?`<div class="meta">También hay ${h.map(x=>esc(x.ot)).join(", ")} de la misma orden</div>`:"";})()}
           <div class="meta">${comps.length
-            ? comps.map(c=>`${c.cantidad}× ${esc(nom(DB.tiposComponente,c.tipoComponenteId))}${c.tipologiaId?" "+esc(nom(DB.tipologias,c.tipologiaId,"")):""}`).join(" · ")
+            ? comps.map(c=>{
+                const tip = c.desglose && c.desglose.length
+                  ? " "+c.desglose.map(d=>`${d.cantidad} ${esc(nom(DB.tipologias,d.tipologiaId,"?"))}`).join(" + ")
+                  : (c.tipologiaId?" "+esc(nom(DB.tipologias,c.tipologiaId,"")):"");
+                return `${c.cantidad}× ${esc(nom(DB.tiposComponente,c.tipoComponenteId))}${tip}`;
+              }).join(" · ")
             : (o.tipoTexto?`<span class="tag">TIPO: ${esc(o.tipoTexto)}</span>`:`<span class="tag">sin componentes cargados</span>`)}</div></div>
           <div class="r">${chipEstado(o.estado)}</div>
         </button>`;}).join("")}</div>`
@@ -2255,7 +2318,16 @@ function pasoActividades(){
       <label class="f"><span>Componente trabajado</span>
         <select id="compSel">
           <option value="">— Selecciona —</option>
-          ${comps.map(x=>`<option value="${x.id}" ${R.componenteId===x.id?"selected":""}>${esc(nom(DB.tiposComponente,x.tipoComponenteId))} · ${esc(nom(DB.tipologias,x.tipologiaId,"—"))}${x.tipSupuesta?" (?)":""} · ${x.cantidad} und · ${esc(nom(DB.cuartos,x.cuartoId))}</option>`).join("")}
+          ${comps.map(x=>{
+            /* El <option> solo admite texto plano, así que el desglose se
+               escribe en la misma línea: "7 ISB + 6 B7" en vez de una sola
+               tipología. Sigue siendo UN componente seleccionable — el
+               técnico registra contra el total, no contra cada parte. */
+            const etiquetaTip = x.desglose && x.desglose.length
+              ? x.desglose.map(d=>`${d.cantidad} ${esc(nom(DB.tipologias,d.tipologiaId,"?"))}`).join(" + ")
+              : esc(nom(DB.tipologias,x.tipologiaId,"—"));
+            return `<option value="${x.id}" ${R.componenteId===x.id?"selected":""}>${esc(nom(DB.tiposComponente,x.tipoComponenteId))} · ${etiquetaTip}${x.tipSupuesta?" (?)":""} · ${x.cantidad} und · ${esc(nom(DB.cuartos,x.cuartoId))}</option>`;
+          }).join("")}
           <option value="__nuevo__">+ Agregar componente a esta OT…</option>
         </select>
       </label>
@@ -5795,7 +5867,8 @@ function camposMapeo(){
     ["fechaIngreso","Fecha de ingreso"],["estado","Estado real"],["cuarto","Cuarto / sección"],
     ["tipologias","Celda TIPO (texto: ISB / CP3 …)"],["motivo","Motivo de ingreso"],
     ["fechaEntrega","Fecha en que SE ENTREGÓ (real)"],["garantia","Garantía: aplica / no aplica"],["obs","Observaciones"],
-    ["componente","Componente (texto)"],["tipologia","Tipología (texto)"],["cantidad","Cantidad (genérica)"]];
+    ["componente","Componente (texto)"],["tipologia","Tipología (texto)"],["cantidad","Cantidad (genérica)"],
+    ["tecnicoHoja","Técnico asignado (de la hoja)"],["novedadHoja","Novedad (de la hoja)"]];
   return base.concat(DB.tiposComponente.map(t=>["comp:"+t.id,"Cantidad · "+t.nombre]));
 }
 Object.defineProperty(window,"CAMPOS",{get:camposMapeo});
@@ -5925,7 +5998,9 @@ function buscarOCrear(col, nombre, extra){
 /* v8: se agregaron TRANS., REGULA. y MICROFILTROS. Al subir este número todos
    los equipos vuelven a detectar las columnas: los mapas guardados apuntaban a
    posiciones viejas desde que la hoja cambió de estructura. */
-const DETECTOR = 8;
+/* v9: reconoce TECNICO y NOVEDAD, y ahora el mapa se reconstruye solo cuando
+   la hoja cambia de estructura, aunque esté fijado a mano. */
+const DETECTOR = 9;
 function detectarMapa(enc, filasMuestra){
   const map={};
   const porNombre=n=>{ const t=DB.tiposComponente.find(x=>x.nombre.toLowerCase().indexOf(n)>=0); return t?("comp:"+t.id):null; };
@@ -5935,6 +6010,8 @@ function detectarMapa(enc, filasMuestra){
     const esCumplimiento = /cumplim|a\s*tiempo|atras|oportun|sla|vencim/.test(k);
     if(/^garant/.test(k)){ map[i]="garantia"; return; }
     if(/^cuarto|^secci|^area$|^área$|^taller/.test(k)){ map[i]="cuarto"; return; }   /* sale del forEach */
+    if(/^tecnico|^t[eé]cnico\s*asignado/.test(k)){ map[i]="tecnicoHoja"; return; }
+    if(/^novedad/.test(k)){ map[i]="novedadHoja"; return; }
     if(/^ot$|orden|n[°o]\s*orden|numero/.test(k)) v="ot";
     else if(/cliente|empresa/.test(k)) v="cliente";
     else if(/entregad/.test(k)) v="fechaEntrega";              /* FECHA ENTREGADO = real */
@@ -6131,6 +6208,10 @@ function aplicarFilas(filas, mapa){
     o.vigente = true;              /* la hoja la trae: cuenta en Ingresos */
 
     const creados=[]; const pendientes=[]; const acum={};
+    /* Guarda de cuánto es cada tipología dentro de un componente mezclado
+       (13 inyectores = 7 ISB + 6 B7). Vive al mismo nivel que "acum" porque
+       una orden puede llegar en varias filas y hay que seguir sumando. */
+    const acumDesglose={};
     filasOT.forEach(({f,fIso})=>{
       if(idx.cliente!==undefined && f[idx.cliente]) o.cliente=f[idx.cliente];
       if(fIso) o.fechaIngreso=fIso;
@@ -6145,6 +6226,11 @@ function aplicarFilas(filas, mapa){
         }
       }
       if(idx.obs!==undefined && f[idx.obs]) o.obs=f[idx.obs];
+      /* Solo se guardan como referencia: es lo que la hoja SUGIERE, nunca
+         restringe quién puede registrar. Coordinación decidió que cualquiera
+         puede trabajar cualquier orden; esto solo preselecciona el nombre. */
+      if(idx.tecnicoHoja!==undefined && f[idx.tecnicoHoja]) o.tecnicoHoja=String(f[idx.tecnicoHoja]).trim();
+      if(idx.novedadHoja!==undefined && f[idx.novedadHoja]) o.novedadHoja=String(f[idx.novedadHoja]).trim();
       if(idx.fechaEntrega!==undefined){ const fe=normFechaEstricta(f[idx.fechaEntrega]); if(fe) o.fechaEntrega=fe; }
       if(idx.motivo!==undefined && f[idx.motivo]){
         const mv=String(f[idx.motivo]).trim();
@@ -6177,10 +6263,75 @@ function aplicarFilas(filas, mapa){
         .filter(x=>!ignorar.has(sinTildes(x)));
       const usados=new Set();
       const cuartoOT=o.cuartoDeclaradoId || cuartoDeclarado(o.ot);
-      const conCantidad = compCols.map(cc=>({cc, cant: parseInt(String(f[cc.i]==null?"":f[cc.i]).replace(/[^\d]/g,""),10)||0}))
-        .filter(x=>x.cant>0);
-      conCantidad.forEach(({cc,cant})=>{
+      /* Se guardan las PARTES de cada celda, no solo el total: así se sabe si
+         "7 / 6" trae dos números o si "3" es uno solo sin partir. */
+      const conCantidad = compCols.map(cc=>{
+        const partes = partirCantidadHoja(f[cc.i]);
+        return {cc, partes, cant: partes.reduce((a,x)=>a+x,0)};
+      }).filter(x=>x.cant>0);
+      conCantidad.forEach(({cc,cant,partes})=>{
         const base = byId(DB.tiposComponente, cc.tipoId); if(!base) return;
+
+        /* CASO EXPLÍCITO: la celda trae tantos números como tipologías hay en
+           TIPO ("7 / 6" con "ISB / B7"). No se adivina nada — el operador ya
+           dijo cuánto es de cada una.
+           Los tokens se agrupan por su destino REAL: si dos tokens apuntan al
+           mismo tipo de componente (los inyectores ISB y B7 son ambos
+           "Inyector Common Rail" — la pieza es igual, solo cambia el motor),
+           se suman en un componente. Si apuntan a destinos distintos (BOMBAS:
+           B7 tiene su propio tipo "Bomba B7", separado de la bomba de alta),
+           quedan en componentes separados.
+           Los tokens NO se marcan como "usados": partir una columna no debe
+           impedir que OTRA columna sin partir (como BOMBAS con un solo "2")
+           siga encontrando su tipología normalmente. */
+        if(partes.length>1 && partes.length===tokens.length){
+          const porDestino = new Map();
+          tokens.forEach((tk,i)=>{
+            const n = partes[i]; if(!n) return;
+            const tip = DB.tipologias.find(x=>coincideTipologia(x,tk));
+            const tipoDestino = (tip && tip.tipoComponenteId && byId(DB.tiposComponente,tip.tipoComponenteId)
+              && familiaDe(byId(DB.tiposComponente,tip.tipoComponenteId).nombre)===familiaDe(base.nombre))
+              ? byId(DB.tiposComponente,tip.tipoComponenteId) : base;
+            const entry = porDestino.get(tipoDestino.id) || {tipo:tipoDestino, cant:0, tipologias:new Set(), porTip:{}};
+            entry.cant += n;
+            if(tip){
+              entry.tipologias.add(tip.id);
+              entry.porTip[tip.id] = (entry.porTip[tip.id]||0) + n;
+            }
+            porDestino.set(tipoDestino.id, entry);
+          });
+          porDestino.forEach(entry=>{
+            acum[entry.tipo.id]=(acum[entry.tipo.id]||0)+entry.cant;
+            /* Una sola tipología entre los tokens que cayeron aquí: se
+               etiqueta con ella. Si son dos tipologías distintas mezcladas
+               en el mismo componente (los 13 inyectores del ejemplo), no se
+               elige una al azar — se deja sin tipología específica antes
+               que mostrar una etiqueta que es solo la mitad de la verdad.
+               Pero SÍ se guarda el desglose: 7 ISB + 6 B7, para que se pueda
+               mostrar aunque el componente sea uno solo para el técnico. */
+            const tipUnico = entry.tipologias.size===1 ? [...entry.tipologias][0] : null;
+            const esMezcla = entry.tipologias.size>1;
+            const dAcum = acumDesglose[entry.tipo.id] = acumDesglose[entry.tipo.id] || {};
+            Object.entries(entry.porTip).forEach(([tid,n])=>{ dAcum[tid]=(dAcum[tid]||0)+n; });
+            const desgloseArr = Object.entries(dAcum)
+              .map(([tid,n])=>({tipologiaId:tid, cantidad:n}))
+              .sort((a,b)=>b.cantidad-a.cantidad);
+            let c2=DB.componentes.find(c=>c.ordenId===o.id && c.tipoComponenteId===entry.tipo.id);
+            if(c2){ c2.cantidad=acum[entry.tipo.id];
+              if(c2.origen!=="manual"){
+                if(tipUnico){ c2.tipologiaId=tipUnico; c2.tipMezcla=false; c2.desglose=null; }
+                else if(esMezcla){ c2.tipologiaId=null; c2.tipMezcla=true; c2.desglose=desgloseArr; }
+              }
+            } else { c2={id:idComponente(o.id,entry.tipo.id),ordenId:o.id,tipoComponenteId:entry.tipo.id,
+              tipologiaId:tipUnico, tipMezcla:esMezcla, desglose:esMezcla?desgloseArr:null,
+              cantidad:acum[entry.tipo.id], cuartoId:entry.tipo.cuartoId,
+              estado:o.estado, serie:"", origen:"hoja"}; DB.componentes.push(c2); nC++; }
+            c2.origen=c2.origen||"hoja";
+            creados.push(c2);
+          });
+          return;
+        }
+
         const r = resolverTipo(base, tokens, usados, cuartoOT);
         if(r.aviso && avisos.indexOf(r.aviso)<0) avisos.push(r.aviso);
         /* Si la celda TIPO trae un solo texto, describe toda la orden y lo
@@ -6226,7 +6377,11 @@ function aplicarFilas(filas, mapa){
         creados.push(comp);
       });
       const libres = tokens.filter(t=>!usados.has(t));
-      const sinTip = creados.filter(c=>!c.tipologiaId);
+      /* No se les asigna una tipología única a los que quedaron marcados como
+         mezcla real (varios tokens en el mismo componente, por ejemplo los
+         13 inyectores ISB+B7): ya se decidió a propósito no elegir una al
+         azar, y esta limpieza no debe deshacer esa decisión. */
+      const sinTip = creados.filter(c=>!c.tipologiaId && !c.tipMezcla);
       const ponerTip=(c,tk,sup)=>{
         const tipo=byId(DB.tiposComponente,c.tipoComponenteId);
         const tp = buscarTipologia(c.tipoComponenteId, tk)
@@ -6243,8 +6398,9 @@ function aplicarFilas(filas, mapa){
     });
 
     /* Si algún componente quedó sin tipología y hay un token que la app ya
-       conoce, se le aplica: es lo que el usuario indicó antes. */
-    creados.filter(c=>!c.tipologiaId).forEach(c=>{
+       conoce, se le aplica: es lo que el usuario indicó antes. Los marcados
+       como mezcla real quedan fuera a propósito. */
+    creados.filter(c=>!c.tipologiaId && !c.tipMezcla).forEach(c=>{
       const txt=(o.tipoTexto||"").split(/[\/;|]+|,/).map(x=>x.trim()).filter(Boolean);
       for(const tk of txt){
         const tp=DB.tipologias.find(x=>coincideTipologia(x,tk));
@@ -6540,11 +6696,46 @@ async function sincronizar(silencioso){
   try{
     const {filas, registros, config} = await leerFuente();
     let remapeado=false;
+
+    /* Si alguien inserta o quita una columna en PROGRAMACION, el mapa
+       guardado —fijado a mano o no— pasa a apuntar a la columna equivocada,
+       y lo hace EN SILENCIO: nada avisa, los datos simplemente empiezan a
+       leerse mal. Esto es lo que pasó al insertar TECNICO y NOVEDAD: el mapa
+       tenía 24 columnas, la hoja pasó a tener 26, y "estado" empezó a leer
+       nombres de técnicos.
+       La defensa: se compara el encabezado de HOY contra el que se usó la
+       última vez que se construyó el mapa. Si cambió —así sea una sola
+       columna— se reconstruye todo por nombre, sin importar que estuviera
+       fijado a mano. Un ajuste manual hecho para una hoja de 24 columnas no
+       sirve para una de 26; es preferible perderlo y detectar de nuevo que
+       seguir leyendo silenciosamente mal. Los ajustes en "fijos" no se
+       pierden: se aplican por el NOMBRE de la columna, no por su posición,
+       así que sobreviven intactos a cualquier reordenamiento. */
+    const normEnc = arr => (arr||[]).map(h=>sinTildes(String(h||"")).trim().toUpperCase());
+    const encActual = normEnc(filas[0]);
+    const encAnterior = normEnc(cx.mapaEncabezados);
+    const cambioEstructura = !!(filas.length && (
+      encActual.length !== encAnterior.length ||
+      encActual.some((h,i)=>h!==encAnterior[i])
+    ));
+
     if(filas.length) cx.encabezados = filas[0];
-    if(filas.length && (!cx.mapa || (cx.mapaVersion!==DETECTOR && !cx.mapaManual))){
-      cx.mapa = detectarMapa(filas[0], filas.slice(1,40)); cx.mapaVersion = DETECTOR; remapeado=true;
+
+    if(filas.length && (!cx.mapa || cambioEstructura || (cx.mapaVersion!==DETECTOR && !cx.mapaManual))){
+      const eraManual = cx.mapaManual;
+      cx.mapa = detectarMapa(filas[0], filas.slice(1,40));
+      cx.mapaVersion = DETECTOR;
+      cx.mapaEncabezados = filas[0];
+      remapeado=true;
+      if(cambioEstructura && eraManual){
+        cx.mapaManual = false;
+        cx.avisoRemapeoEstructural = { fecha: new Date().toISOString(),
+          antes: (cx.mapaEncabezados||[]).length, ahora: filas[0].length };
+      }
     }
-    /* Tus ajustes manuales mandan siempre, se detecte lo que se detecte. */
+    /* Tus ajustes manuales mandan siempre, se detecte lo que se detecte.
+       Se aplican por nombre de columna, así que siguen valiendo aunque la
+       hoja se haya reordenado. */
     if(filas.length && cx.fijos){
       filas[0].forEach((h,i)=>{ const k=sinTildes(String(h||"")); if(cx.fijos[k]) cx.mapa[i]=cx.fijos[k]; });
     }
@@ -6974,6 +7165,13 @@ function vConexion(){
         Una fila sin fecha suele ser un registro incompleto: por eso conviene dejarla fuera.</p>
         <p class="hint" style="margin-top:-6px">0 = solo manual. También sincroniza al abrir la app.</p>
         <button class="btn primary" id="cxGuardar">Guardar conexión</button>
+        ${cx.avisoRemapeoEstructural?`<div style="border:1px solid #f3ccb0;background:#fdefe5;color:var(--signal);padding:10px 12px;border-radius:var(--r);margin:12px 0;font-size:13px">
+        <b>Se detectó un cambio en la estructura de la hoja</b> y las columnas se volvieron a leer por nombre, automáticamente.
+        Antes se conocían ${cx.avisoRemapeoEstructural.antes} columnas; ahora hay ${cx.avisoRemapeoEstructural.ahora}.
+        Tu mapeo fijado a mano se soltó porque era para la estructura anterior — revisa la tabla de abajo y vuelve a fijar
+        lo que necesites. Si algo se leyó mal entre que cambió la hoja y ahora, usa <b>Rehacer registros</b> en Datos, o
+        pídeme revisar órdenes puntuales.
+        <button class="btn sm" id="cxCerrarAviso" style="margin-top:7px">Entendido</button></div>`:""}
         ${cx.mapa&&cx.mapaVersion!==DETECTOR?`<div style="border:1px solid #ecd6a4;background:#fdf5e3;color:var(--amber);padding:9px 11px;border-radius:var(--r);margin:12px 0;font-size:13px">
         <b>Tu mapeo es de una versión anterior.</b> ${cx.mapaManual?`Como lo ajustaste a mano, no lo toco solo. Si quieres que reconozca las columnas nuevas (motivo, garantía, fecha entregado), pulsa “Rehacer mapeo”.`:`Se actualizará solo en la próxima sincronización.`}</div>`:""}
       ${cx.mapa?`<button class="btn" id="cxRemap" style="margin-left:8px">Rehacer mapeo de columnas</button>
@@ -7092,6 +7290,7 @@ function pConexion(){
   const rm=$("#cxRemap"); if(rm) rm.onclick=()=>commit(()=>{ DB.meta.conexion.mapa=null;
     DB.meta.conexion.mapaManual=false; DB.meta.conexion.mapaVersion=0; DB.meta.conexion.fijos=null; },
     "Se detectará de nuevo al sincronizar");
+  const ca=$("#cxCerrarAviso"); if(ca) ca.onclick=()=>commit(()=>{ delete DB.meta.conexion.avisoRemapeoEstructural; });
   document.querySelectorAll("[data-cxmap]").forEach(sel=>sel.onchange=()=>{
     const i=sel.dataset.cxmap, v=sel.value;
     commit(()=>{ DB.meta.conexion.mapa[i]=v; DB.meta.conexion.mapaManual=true;

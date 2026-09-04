@@ -809,9 +809,30 @@ function esNoProductiva(actividadId){ const a=byId(DB.actividades,actividadId); 
    aseo, reuniones, mantenimiento de equipos. Antes bastaba con elegir la
    actividad Apoyo para que las horas se descontaran de la jornada aunque el
    técnico estuviera reparando un inyector del cuarto vecino. */
+/* Si el técnico escribió un número de OT real en la novedad —"apoyo con la
+   36530", "ayudé con orden 4431"— cuenta como que sí hay orden, aunque no la
+   haya elegido en el campo estructurado. Solo cuenta si el número coincide
+   EXACTO con una orden que de verdad existe: no adivina con cualquier cifra
+   suelta, como una cantidad o una hora. */
+function otMencionadaEnTexto(texto){
+  if(!texto) return false;
+  const numeros = String(texto).match(/\d{3,6}/g);
+  if(!numeros) return false;
+  return numeros.some(n=>DB.ordenes.some(o=>String(o.ot)===n));
+}
+/* Igual que la anterior, pero para MOSTRAR cuál número encontró — la otra
+   solo dice sí/no, esta dice cuál. */
+function otNumeroMencionado(texto){
+  if(!texto) return null;
+  const numeros = String(texto).match(/\d{3,6}/g);
+  if(!numeros) return null;
+  const hallado = numeros.find(n=>DB.ordenes.some(o=>String(o.ot)===n));
+  return hallado || null;
+}
 function registroNoProductivo(r){
   if(!r) return false;
   if(r.ordenId || r.componenteId || r.otTexto) return false;   /* hay OT: es producción */
+  if(otMencionadaEnTexto(r.novedad)) return false;              /* la escribió en la novedad */
   return esNoProductiva(r.actividadId);
 }
 function minutosNoProductivos(regs){ return regs.filter(registroNoProductivo).reduce((a,r)=>a+r.minutos,0); }
@@ -3072,8 +3093,16 @@ function vDashboard(){
     const rr=rs.filter(r=>r.tecnicoId===t.id);
     const m=rr.reduce((a,x)=>a+x.minutos,0), s=rr.reduce((a,x)=>a+x.minutosStd,0);
     const capReal=capacidadTecnicoRango(t.id,d,h);
+    /* Productividad: de lo que registró, cuánto fue trabajo real — con orden,
+       o apoyo que sí tenía OT aunque la haya escrito en la novedad — contra
+       cuánto fue aseo, reuniones o apoyo genuinamente sin ninguna orden detrás.
+       Es distinto de la ocupación: la ocupación no distingue el tipo de tarea,
+       esto sí. Un técnico puede tener 100% de ocupación y baja productividad
+       si gran parte de esas horas fueron sin orden. */
+    const noProd=minutosNoProductivos(rr);
     return {t, min:m, std:s, cap:capReal, aus:capacidadRango(d,h)-capReal,
-            ex:minutosExtra(t.id,d,h)};
+            ex:minutosExtra(t.id,d,h), oc:capReal?Math.round(m/capReal*100):0,
+            pr:capReal?Math.round((m-noProd)/capReal*100):0};
   }).sort((a,b)=>b.min-a.min);
   const maxT = Math.max(1,...porTec.map(x=>Math.max(x.cap,x.min)));
 
@@ -3118,42 +3147,6 @@ function vDashboard(){
 
   return `
   ${filtrosDash()}
-  ${(()=>{
-    /* Órdenes cuya lectura de componentes quedó dudosa. Antes esto solo se veía
-       en la pestaña Órdenes; sin ella, el aviso vive aquí para que nadie
-       registre sobre una orden mal leída sin enterarse. */
-    const rev = DB.ordenes.filter(o=>o.revisar);
-    if(!rev.length) return "";
-    /* Se muestra QUÉ texto no se pudo ubicar, no solo el número de orden.
-       Sin eso, "36459 por revisar" no dice qué hay que hacer. */
-    const sinComp = o => !DB.componentes.some(c=>c.ordenId===o.id);
-    return `<div class="card" style="border-color:#f3ccb0;background:#fdefe5;margin-bottom:14px">
-      <header style="background:transparent;border-bottom-color:#f3ccb0">
-        <h2 style="color:var(--signal)">${rev.length} orden(es) por revisar</h2>
-        <span class="sub">la celda TIPO trae algo que no se pudo ubicar</span></header>
-      <div class="body" style="padding-top:10px">
-        <div class="tw"><table><thead><tr><th>Orden</th><th>Cliente</th><th>TIPO sin ubicar</th><th>Qué falta</th></tr></thead><tbody>
-        ${rev.slice(0,15).map(o=>`<tr>
-          <td class="mono"><b>${esc(o.ot||"?")}</b></td>
-          <td>${esc(o.cliente||"")}</td>
-          <td><span class="chip c-naranja">${esc((o.revisar||[]).join(" / "))}</span></td>
-          <td>${sinComp(o)
-            ? `la orden no tiene componentes cargados${o.origen==="manual"?" · se creó a mano en la app":" · quizá ya no está en la hoja"}`
-            : "esa palabra no está en el diccionario de tipologías"}</td></tr>`).join("")}
-        </tbody></table></div>
-        ${rev.length>15?`<p class="hint">y ${rev.length-15} más</p>`:""}
-        <p class="hint" style="margin-top:9px"><b>Cómo se resuelve.</b>
-        Si el texto es una tipología nueva, agrégala en <b>Maestros → Tipologías</b> con el cuarto o el componente
-        que le corresponde, y al sincronizar se ubica sola en todas las órdenes que la traigan.
-        Si es un dato que no describe un componente —un número de serie, "EGR", "FILTROS"— corrige la celda TIPO
-        en PROGRAMACION. Y si la orden llegó sin cantidades, hay que escribirlas en la hoja.</p>
-        <p class="hint"><b>¿La orden ya no existe en PROGRAMACION?</b>
-        Entonces quedó huérfana: estuvo en la hoja, se corrigió o se borró, y la app se quedó con la copia vieja.
-        Eso pasa sobre todo cuando se arregla un número de OT mal digitado. Usa
-        <button class="btn sm" id="irDepurar">Depurar órdenes</button> — compara contra la hoja y quita las que sobran.
-        Nunca toca las que tienen horas registradas.</p>
-      </div></div>`;
-  })()}
   ${(()=>{
     /* Días en los que lo registrado no cabe en la jornada. Los registros hechos
        antes de que existiera el aviso nunca se confirmaron como extra, así que
@@ -3217,7 +3210,10 @@ function vDashboard(){
       <div class="body">${porTec.length?`<div class="bars">${porTec.map(x=>`
         <div class="bar"><div class="t">${esc(x.t.nombre)}</div>
           <div class="track"><i style="width:${Math.min(100,x.min/maxT*100)}%"></i></div>
-          <div class="n">${hrs(x.min)} / ${hrs(x.cap)} h${x.aus>0?` <span class="chip c-azul" title="Jornada descontada por ausencia">−${hrs(x.aus)} h</span>`:""}${x.ex>0?` <span class="chip c-naranja" title="Registró más horas que su jornada">+${hrs(x.ex)} h</span>`:""}</div></div>`).join("")}</div>`:`<div class="empty">Sin datos en el rango.</div>`}</div></div>
+          <div class="n">${hrs(x.min)} / ${hrs(x.cap)} h
+            <span class="chip ${x.oc>=90?"c-verde":x.oc>=60?"c-ambar":"c-naranja"}" title="Horas registradas ÷ jornada">${x.oc}% ocupación</span>
+            <span class="chip ${x.pr>=85?"c-verde":x.pr>=60?"c-ambar":"c-naranja"}" title="De lo registrado, cuánto fue trabajo con orden detrás (el apoyo con OT cuenta; aseo y reuniones sin orden, no)">${x.pr}% productividad</span>
+            ${x.aus>0?` <span class="chip c-azul" title="Jornada descontada por ausencia">−${hrs(x.aus)} h</span>`:""}${x.ex>0?` <span class="chip c-naranja" title="Registró más horas que su jornada">+${hrs(x.ex)} h</span>`:""}</div></div>`).join("")}</div>`:`<div class="empty">Sin datos en el rango.</div>`}</div></div>
 
     <div class="card"><header><h2>Horas por cuarto</h2></header>
       <div class="body">${porCuarto.length?`<div class="bars">${porCuarto.map(x=>`
@@ -3241,7 +3237,11 @@ function vDashboard(){
   <div class="card"><header><h2>Detalle de registros</h2><span class="sub mono">${rs.length} filas</span>
     <div class="push"><label class="hint" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="verAnulados" ${FD.verAnulados?"checked":""}> ver anulados</label>
     <button class="btn sm" id="csvReg">Exportar CSV</button></div></header>
-    <div class="body"><div class="tw" style="max-height:420px;overflow:auto"><table>
+    <div class="body">
+    <p class="hint" style="margin-top:0">Cuando una fila dice <b>"sin orden · OT 36530"</b>, el técnico marcó "sin orden" pero mencionó ese
+    número en la novedad, y coincide con una orden real: esas horas cuentan como producción, no se descuentan de su jornada.
+    Solo pasa si el número coincide exacto con una orden que existe — no adivina con cualquier cifra suelta.</p>
+    <div class="tw" style="max-height:420px;overflow:auto"><table>
       <thead><tr><th>Fecha</th><th>Técnico</th><th>OT</th><th>Componente</th><th>Actividad</th><th class="num">Und</th><th class="num">Horas</th><th class="num">h/unidad</th><th>Novedad</th><th></th></tr></thead>
       <tbody>${(FD.verAnulados? DB.registros.filter(r=>{const [dd,hh]=rangoActivo(); return r.fecha>=dd&&r.fecha<=hh&&(!FD.cuarto||r.cuartoId===FD.cuarto)&&(!FD.tecnico||r.tecnicoId===FD.tecnico);}) : rs)
         .slice().sort((a,b)=>b.fecha.localeCompare(a.fecha)||String(b.creado).localeCompare(String(a.creado))).map(r=>{
@@ -3250,7 +3250,12 @@ function vDashboard(){
         return `<tr style="${r.anulado?"opacity:.5;text-decoration:line-through":""}">
         <td class="mono">${fmtFecha(r.fecha)}</td>
         <td>${esc(nom(DB.tecnicos,r.tecnicoId))}${r.capturadoPor?`<br><span class="tag" title="Lo capturó coordinación por él">lo registró ${esc(nom(DB.tecnicos,r.capturadoPor))}</span>`:""}</td>
-        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden?`<span class="tag">sin orden</span>`:(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?esc(r.compTexto):"—")}</td>
+        <td class="mono">${o?esc(etiquetaOT(o)):(r.sinOrden
+            ?(()=>{ const otHallada=otNumeroMencionado(r.novedad);
+                return otHallada
+                  ? `<span class="tag" title="Encontrada en la novedad: cuenta como producción">sin orden · OT ${esc(otHallada)}</span>`
+                  : `<span class="tag">sin orden</span>`; })()
+            :(r.otTexto?`${esc(r.otTexto)} <span class="tag">ya no está en la hoja</span>`:`<span class="chip c-naranja">sin OT</span>`))}</td><td>${c?esc(nom(DB.tiposComponente,c.tipoComponenteId)):(r.compTexto?esc(r.compTexto):"—")}</td>
         <td>${esc(nom(DB.actividades,r.actividadId))}</td><td class="num">${r.cantidad}</td>
         <td class="num">${hrs(r.minutos)}</td><td class="num">${r.cantidad>0?hrs(r.minutos/r.cantidad):"—"}</td>
         <td>${r.tipoNovedad?`<span class="chip c-naranja">${esc(r.tipoNovedad)}</span> ${esc(r.novedad||"")}`:""}
@@ -3291,9 +3296,6 @@ function diasHabiles(d,h){
   return Math.max(1,n);
 }
 function pDashboard(){
-  /* El aviso de órdenes por revisar vive aquí, así que su botón se conecta
-     aquí. Estaba conectado en Conexión y no hacía nada. */
-  const dpD=$("#irDepurar"); if(dpD) dpD.onclick=()=>depurarOrdenes();
   const aa=$("#ausAdd"); if(aa) aa.onclick=()=>modalAusencia();
   document.querySelectorAll("[data-auscerrar]").forEach(b=>b.onclick=()=>{
     const id=b.dataset.auscerrar;
@@ -7107,6 +7109,47 @@ function vConexion(){
         ${(cx.ultimoResumen.nuevosEstados||[]).length?`<tr style="background:#eaf1f8"><td>Estados nuevos encontrados en la hoja<br><span class="tag">${cx.ultimoResumen.nuevosEstados.map(esc).join(" · ")}</span><br><span class="tag">Ve a Maestros → Listas y marca cuáles cierran la orden</span></td><td class="num mono">${cx.ultimoResumen.nuevosEstados.length}</td></tr>`:""}
         ${cx.ultimoResumen.sinFecha?`<tr style="background:#fdf5e3"><td>Filas sin fecha legible <span class="tag">${(cx.sinFecha||"omitir")==="omitir"?"omitidas":"importadas"}</span></td><td class="num mono">${cx.ultimoResumen.sinFecha}</td></tr>`:""}
         </tbody></table></div>`:""}
+      ${(()=>{
+        /* Órdenes cuya lectura de componentes quedó dudosa. Vive aquí, no en el
+           Dashboard: es un asunto de calidad de datos de la hoja, no del día a
+           día de los técnicos. Solo cuenta las ABIERTAS — a una orden ya
+           entregada no le sirve a nadie que alguien la revise hoy, y suele ser
+           lectura vieja que quedó congelada de antes de un ajuste de columnas. */
+        const rev = DB.ordenes.filter(o=>o.revisar && !estaCerrada(o));
+        if(!rev.length) return "";
+        const sinComp = o => !DB.componentes.some(c=>c.ordenId===o.id);
+        return `<div class="card" style="border-color:#f3ccb0;background:#fdefe5;margin-bottom:14px">
+          <header style="background:transparent;border-bottom-color:#f3ccb0">
+            <h2 style="color:var(--signal)">${rev.length} orden(es) abierta(s) por revisar</h2>
+            <span class="sub">la celda TIPO trae algo que no se pudo ubicar</span></header>
+          <div class="body" style="padding-top:10px">
+            <div class="tw"><table><thead><tr><th>Orden</th><th>Cliente</th><th>TIPO sin ubicar</th><th>Qué falta</th></tr></thead><tbody>
+            ${rev.slice(0,15).map(o=>`<tr>
+              <td class="mono"><b>${esc(o.ot||"?")}</b></td>
+              <td>${esc(o.cliente||"")}</td>
+              <td><span class="chip c-naranja">${esc((o.revisar||[]).join(" / "))}</span></td>
+              <td>${sinComp(o)
+                ? `la orden no tiene componentes cargados${o.origen==="manual"?" · se creó a mano en la app":" · quizá ya no está en la hoja"}`
+                : "esa palabra no está en el diccionario de tipologías"}</td></tr>`).join("")}
+            </tbody></table></div>
+            ${rev.length>15?`<p class="hint">y ${rev.length-15} más</p>`:""}
+            <p class="hint" style="margin-top:9px"><b>Cómo se resuelve.</b>
+            Si el texto es una tipología nueva, agrégala en <b>Maestros → Tipologías</b> con el cuarto o el componente
+            que le corresponde, y al sincronizar se ubica sola en todas las órdenes que la traigan.
+            Si es un dato que no describe un componente —un número de serie, "EGR", "FILTROS"— corrige la celda TIPO
+            en PROGRAMACION. Y si la orden llegó sin cantidades, hay que escribirlas en la hoja.<br>
+            Si el texto que ves aquí no se parece en nada a lo que hay hoy en PROGRAMACION (por ejemplo, algo como
+            "21 días" en vez de un motor o repuesto), es una lectura vieja que quedó congelada de antes de un ajuste
+            de columnas, de una orden que no ha vuelto a aparecer en una sincronización reciente. Amplía
+            <b>"Importar solo órdenes desde"</b> más abajo a una fecha anterior y sincroniza, para que esa fila
+            se vuelva a leer con el mapeo correcto.</p>
+            <p class="hint"><b>¿La orden ya no existe en PROGRAMACION?</b>
+            Entonces quedó huérfana: estuvo en la hoja, se corrigió o se borró, y la app se quedó con la copia vieja.
+            Eso pasa sobre todo cuando se arregla un número de OT mal digitado. Usa
+            <button class="btn sm" id="irDepurar">Depurar órdenes</button> — compara contra la hoja y quita las que sobran.
+            Nunca toca las que tienen horas registradas.</p>
+          </div></div>`;
+      })()}
       <div class="seg" style="margin-bottom:14px">
         <button data-modo="" class="${cx.modo===""?"on":""}">Manual</button>
         <button data-modo="panel" class="${cx.modo==="panel"?"on":""}">Puente del Panel</button>
@@ -7263,6 +7306,7 @@ function pConexion(){
     sincronizar();
   };
   const dp=$("#depurarCx"); if(dp) dp.onclick=()=>depurarOrdenes();
+  const dpr=$("#irDepurar"); if(dpr) dpr.onclick=()=>depurarOrdenes();
   const dp2=$("#irDepurar"); if(dp2) dp2.onclick=()=>depurarOrdenes();
   const ro=$("#rastrearOT"); if(ro) ro.onclick=()=>modalBuscarOT();
   const au=$("#auditarCx"); if(au) au.onclick=()=>modalAuditar();

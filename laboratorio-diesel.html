@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-04 · v53";
+const VERSION_APP = "2026-09-07 · v58";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -507,9 +507,16 @@ function pesoActividad(tc, actId){
 function actividadesDeComponente(tipoComponenteId, cuartoId){
   const todas = actividadesDe(cuartoId);
   const props = minutosPropios(tipoComponenteId);
-  if(!props.length) return todas;
+  /* Las actividades de fase Apoyo (aseo, reunión, apoyo genérico) solo tienen
+     sentido cuando NO hay una orden detrás — para eso existe "Actividad sin
+     orden". Mostrarlas también aquí, en un componente real, confundía al
+     técnico y además abría una grieta: marcar "Apoyo" contra un componente
+     con orden hacía que esas horas se contaran como producción, saltándose
+     por completo la marca de no-productiva de esa actividad. */
+  const conOrden = todas.filter(a=>a.fase!=="Apoyo");
+  if(!props.length) return conOrden;
   const con = new Set(props.map(e=>e.actividadId));
-  return todas.filter(a=>con.has(a.id) || a.noProductiva);
+  return conOrden.filter(a=>con.has(a.id));
 }
 /* Suma por fase, para el resumen en vivo del editor. */
 function resumenTiempos(tc){
@@ -869,6 +876,48 @@ function faseAlcanzada(componenteId, hastaISO){
 }
 
 var NOMBRE_FASE = ["sin empezar","Diagnóstico","Lavado","Reparación","Entrega"];
+
+/* Cuántos días pasan entre el PRIMER toque de una pieza —de cualquier técnico—
+   y el día en que llegó a Entrega. Es distinto de "piezas que avanzaron":
+   eso mide si se movió ESTA semana; esto mide cuánto tardó de principio a fin,
+   sin importar cuántas semanas tomó ni cuántos técnicos la tocaron en el
+   camino. No cuenta fines de semana ni festivos — un componente quieto el
+   sábado no es un componente lento. */
+function cicloComponente(componenteId){
+  let primero = "", entrega = "";
+  RA().forEach(r=>{
+    if(r.componenteId!==componenteId) return;
+    if(!primero || r.fecha<primero) primero = r.fecha;
+    if(nivelDeActividad(r.actividadId)>=3 && (!entrega || r.fecha<entrega)) entrega = r.fecha;
+  });
+  if(!primero || !entrega || entrega<primero) return null;
+  let dias=0; const b=new Date(entrega+"T12:00:00");
+  const cur=new Date(primero+"T12:00:00");
+  while(cur<b){ if(capacidadDia(isoLocal(cur))) dias++; cur.setDate(cur.getDate()+1); }
+  return {primero, entrega, dias};
+}
+
+/* Ciclo de las piezas que un técnico entregó en el periodo: el crédito es de
+   quien registró la actividad de Entrega, igual que en avancePeriodo. Se
+   guarda la mediana, no el promedio: una pieza atascada por falta de repuesto
+   no debe arruinar la lectura del resto. */
+function cicloPorTecnico(desde, hasta, cuartoId, tecnicoId){
+  const porTec = {};
+  RA().forEach(r=>{
+    if(r.fecha<desde || r.fecha>hasta) return;
+    if(nivelDeActividad(r.actividadId)<3) return;                 /* solo entregas */
+    if(tecnicoId && r.tecnicoId!==tecnicoId) return;
+    if(cuartoId && r.cuartoId!==cuartoId) return;
+    const c = byId(DB.componentes, r.componenteId); if(!c) return;
+    const ciclo = cicloComponente(c.id); if(!ciclo || ciclo.entrega<desde || ciclo.entrega>hasta) return;
+    (porTec[r.tecnicoId] = porTec[r.tecnicoId] || []).push(ciclo.dias);
+  });
+  const out = {};
+  Object.entries(porTec).forEach(([tid,dd])=>{ out[tid] = {mediana: mediana(dd), n: dd.length}; });
+  return out;
+}
+
+
 
 /* Qué se movió durante el periodo: piezas que subieron de fase, y piezas
    abiertas que llevan días sin que nadie las toque. */
@@ -1376,24 +1425,14 @@ function partirCantidadHoja(raw){
   if(texto.indexOf("/")<0) return [parseInt(texto.replace(/[^\d]/g,""),10)||0];
   return texto.split("/").map(p=>parseInt(String(p).replace(/[^\d]/g,""),10)||0);
 }
-const DESGLOSES = [
-  /* En un motor B7 la columna BOMBAS nunca trae bombas de alta presión.
-     Son bombas B7, y cuando la cantidad es 3 una de ellas es la de
-     transferencia (verificado en 11 órdenes: nunca aparecen 4 ni 5, y las
-     observaciones de almacén lo confirman: "BOMB TRANSF OK Y REGULADOR B7").
-     Las de alta presión quedan para ISB, CP3, CP4, HP3, Denso y las demás. */
-  { cuarto:"Electrónico", desde:"Bomba de alta presión CR", palabra:/\bb7\b/i,
-    partir: function(n){
-      return n===3
-        ? [{nombre:"Bomba B7", cant:2}, {nombre:"Transferencia", cant:1}]
-        : [{nombre:"Bomba B7", cant:n}];
-    },
-    nota: function(n){
-      return n===3
-        ? "3 bombas en un motor B7: se leyeron como 2 bombas B7 + 1 de transferencia. Verifica."
-        : n+" bomba(s) en un motor B7: se leyeron como bombas B7, no de alta presión.";
-    } }
-];
+/* Esta regla quedó retirada: existía para cuando la columna BOMBAS mezclaba
+   la bomba de transferencia junto con las de alta presión, porque no había
+   una columna TRANS. separada. Ahora que TRANS. existe aparte en la hoja,
+   la transferencia se lee directo de ahí — este parche ya no aplica y
+   forzarlo solo restaría de donde no corresponde.
+   Se deja el arreglo vacío (no la función) por si algún día aparece una
+   regla de negocio genuina que sí necesite repartir una cantidad fija. */
+const DESGLOSES = [];
 /* Devuelve las partes en que se abre un componente, o null si no aplica. */
 function desglosarComponente(tipo, cantidad, tipoTexto, cuartoOT){
   const nomCuarto = nom(DB.cuartos, cuartoOT, "");
@@ -2258,7 +2297,13 @@ function pasoOrden(){
   const miCuarto = me? me.cuartoId : "";
   const cerr = cerrados();
 
-  const abiertas = DB.ordenes.filter(o=>!cerr.has(o.estado));
+  const hoy = hoyISO();
+  const ayer = restarDias(hoy, 1);
+  /* Un día de gracia: si coordinación marca la orden como cerrada hoy o ayer,
+     sigue apareciendo para que quien la estaba trabajando alcance a registrar
+     lo que hizo antes de que desaparezca. Pasado ese día, se va de la lista
+     como siempre. */
+  const abiertas = DB.ordenes.filter(o=>!cerr.has(o.estado) || (o.cerroEn && o.cerroEn>=ayer));
   const filtradoPorCuarto = !R.todas && !!miCuarto;
   const base = filtradoPorCuarto ? abiertas.filter(o=>cuartosDeOrden(o).has(miCuarto)) : abiertas;
   const lista = base
@@ -2273,7 +2318,6 @@ function pasoOrden(){
   <div class="card">
     <header><h2>Paso 1 · Elige la orden</h2>
       <span class="sub mono">${lista.length} abiertas${filtradoPorCuarto?" · "+esc(nom(DB.cuartos,miCuarto)):""}</span>
-      <div class="push"><button class="btn sm" id="nuevaOT">+ Orden nueva</button></div>
     </header>
     <div class="body">
       <label class="f"><span>Fecha del registro</span>
@@ -2317,12 +2361,15 @@ function pasoOrden(){
                   : (c.tipologiaId?" "+esc(nom(DB.tipologias,c.tipologiaId,"")):"");
                 return `${c.cantidad}× ${esc(nom(DB.tiposComponente,c.tipoComponenteId))}${tip}`;
               }).join(" · ")
-            : (o.tipoTexto?`<span class="tag">TIPO: ${esc(o.tipoTexto)}</span>`:`<span class="tag">sin componentes cargados</span>`)}</div></div>
+            : (o.tipoTexto?`<span class="tag">TIPO: ${esc(o.tipoTexto)}</span>`:`<span class="tag">sin componentes cargados</span>`)}</div>
+          ${(cerr.has(o.estado) && o.cerroEn)?`<div class="meta" style="color:var(--signal)">Ya se cerró en la hoja — puedes registrar lo de hoy, mañana ya no aparecerá</div>`:""}</div>
           <div class="r">${chipEstado(o.estado)}</div>
         </button>`;}).join("")}</div>`
       :`<div class="empty">${q
           ? `Ninguna orden abierta de ${esc(nom(DB.cuartos,miCuarto))} coincide con “${esc(q)}”.<br><br>
-             <button class="btn primary" id="crearBuscada">Crear la orden ${esc(q)}</button>`
+             <span class="hint">Si es una orden real, revisa el número — PROGRAMACION es quien manda.
+             Puede que aún no haya llegado en la última sincronización: pídele a coordinación que
+             sincronice, o verifica la fecha de corte en Conexión.</span>`
           : `No hay órdenes abiertas asignadas a <b>${esc(nom(DB.cuartos,miCuarto))}</b>.<br><br>
              ${(()=>{const porCu=DB.cuartos.map(c=>({c, n:abiertas.filter(o=>cuartosDeOrden(o).has(c.id)).length})).filter(x=>x.n);
                const sinCu=abiertas.filter(o=>!cuartosDeOrden(o).size).length;
@@ -2395,9 +2442,11 @@ function pasoActividades(){
       })()}
       <div class="eyebrow" style="margin:14px 0 7px">Actividades de ${esc(nom(DB.cuartos,c.cuartoId))} · marca las que realizaste</div>
       ${(()=>{ /* las marcadas "aparte" van en su propio bloque, no mezcladas
-                   con las fases del proceso normal */
+                   con las fases del proceso normal. "Apoyo" no se recorre aquí:
+                   actividadesDeComponente() ya las excluye siempre — esas
+                   actividades solo tienen sentido en "Actividad sin orden". */
         const esAp=a=>{ const e=estandarDe(c.tipoComponenteId,a.id); return !!(e && e.aparte); };
-        return ["Diagnóstico","Lavado","Reparación","Entrega","Apoyo","Aparte"];})()
+        return ["Diagnóstico","Lavado","Reparación","Entrega","Aparte"];})()
        .map(fase=>{
         const esAp=a=>{ const e=estandarDe(c.tipoComponenteId,a.id); return !!(e && e.aparte); };
         const grupo = fase==="Aparte" ? acts.filter(esAp) : acts.filter(a=>a.fase===fase && !esAp(a));
@@ -2581,8 +2630,6 @@ function pRegistro(){
   document.querySelectorAll("[data-ot]").forEach(b=>b.onclick=()=>{
     R.ordenId=b.dataset.ot; R.componenteId=null; R.sel={}; R.paso=2; window.scrollTo(0,0); render();
   });
-  const $n=$("#nuevaOT"); if($n) $n.onclick=()=>modalOrden(null, R.busca.trim());
-  const $cb=$("#crearBuscada"); if($cb) $cb.onclick=()=>modalOrden(null, R.busca.trim());
   const $vt=$("#verTodas"); if($vt) $vt.onchange=e=>{ R.todas=e.target.checked; render(); };
   const $so=$("#sinOrden"); if($so) $so.onclick=()=>modalSinOrden();
   const $c=$("#compSel"); if($c) $c.onchange=e=>{
@@ -3737,8 +3784,31 @@ function vSemanal(){
 
   const ritmos = ritmoPorTecnico(rs);
   const av = avancePeriodo(d, h, FD.cuarto, FD.tecnico);
-  const piezasAvanzaron = av.avanzaron.reduce((a,x)=>a+x.piezas,0);
-  const piezasQuietas   = av.quietas.reduce((a,x)=>a+(+x.c.cantidad||0),0);
+  const tecFiltrado = FD.tecnico ? byId(DB.tecnicos, FD.tecnico) : null;
+
+  /* Sin filtro: el laboratorio completo, como siempre.
+     Con filtro de técnico: no se limita a "filtrar el mismo número" — dos de
+     los cuatro KPI se reformulan, porque atribuirle a una sola persona algo
+     que depende de otros (que llegue el repuesto, que autoricen) sería
+     mentir con la etiqueta aunque el número esté bien calculado. */
+  const piezasAvanzaron = tecFiltrado
+    ? (av.porTecnico[tecFiltrado.id]||{}).piezas || 0     /* crédito real: él produjo el salto de fase */
+    : av.avanzaron.reduce((a,x)=>a+x.piezas,0);
+
+  /* "Piezas quietas" para un técnico no es "las que le tocan" — es "las que
+     él dejó" (fue el último en tocarlas) y nadie, ni él, las ha movido desde
+     entonces. Puede seguir sin ser su culpa (falta de repuesto), por eso se
+     conserva la misma nota de siempre. */
+  const ultimoQueToco = componenteId => {
+    let ult=null;
+    RA().forEach(r=>{ if(r.componenteId===componenteId && (!ult || r.fecha>ult.fecha)) ult=r; });
+    return ult ? ult.tecnicoId : null;
+  };
+  const quietasDelTecnico = tecFiltrado
+    ? av.quietas.filter(x=>ultimoQueToco(x.c.id)===tecFiltrado.id)
+    : av.quietas;
+  const piezasQuietas = quietasDelTecnico.reduce((a,x)=>a+(+x.piezas||0),0);
+
   /* Solo lo que salió DENTRO del periodo. Antes mostraba el histórico completo
      (622 de 771), que no dice nada sobre la semana que se está presentando. */
   const entregadas = DB.ordenes.filter(o=>{
@@ -3747,6 +3817,11 @@ function vSemanal(){
     const ref = o.fechaEntrega || o.fechaIngreso;
     if(!ref || ref<d || ref>h) return false;
     if(FD.cuarto && !cuartosDeOrden(o).has(FD.cuarto)) return false;
+    /* Con filtro de técnico: no es "él la entregó" — nadie entrega solo una
+       orden, eso lo decide que llegue el repuesto y el cliente autorice. Es
+       "trabajó en una orden que sí llegó a salir", que es lo honesto. */
+    if(tecFiltrado && !DB.componentes.some(c=>c.ordenId===o.id
+        && RA().some(r=>r.componenteId===c.id && r.tecnicoId===tecFiltrado.id))) return false;
     return true;
   }).length;
   /* Salieron sin repararse: no autorizadas o dadas de baja. */
@@ -3758,6 +3833,20 @@ function vSemanal(){
     if(FD.cuarto && !cuartosDeOrden(o).has(FD.cuarto)) return false;
     return true;
   }).length;
+
+  /* Sus órdenes del periodo: en qué quedó cada una que tocó, para responder
+     "en qué va" sin tener que cruzar tablas. Solo se arma si hay filtro. */
+  const susOrdenes = tecFiltrado ? (()=>{
+    const compsSuyos = DB.componentes.filter(c=>RA().some(r=>r.componenteId===c.id
+      && r.tecnicoId===tecFiltrado.id && r.fecha>=d && r.fecha<=h));
+    const porOrden = {};
+    compsSuyos.forEach(c=>{
+      const o = byId(DB.ordenes, c.ordenId); if(!o) return;
+      (porOrden[o.id] = porOrden[o.id] || {o, comps:[]}).comps.push(c);
+    });
+    return Object.values(porOrden).sort((a,b)=>(b.o.fechaIngreso||"").localeCompare(a.o.fechaIngreso||""));
+  })() : [];
+
   const novs={}; rs.forEach(r=>{ if(r.tipoNovedad){ (novs[r.tipoNovedad]=novs[r.tipoNovedad]||[]).push(r); } });
 
   return `
@@ -3771,33 +3860,43 @@ function vSemanal(){
   </div><p class="hint">Imprime a PDF y tienes la presentación semanal lista. Cada bloque es una diapositiva.</p></div></div>
 
   <div class="card"><header>
-      <h2>1 · El flujo del laboratorio</h2>
+      <h2>1 · ${tecFiltrado?`Lo que movió ${esc(tecFiltrado.nombre)}`:"El flujo del laboratorio"}</h2>
       <span class="sub mono">${fmtFecha(d)} → ${fmtFecha(h)}</span></header>
     <div class="body">
-      <p class="hint" style="margin-top:0">Cómo se movió el trabajo. Estas cifras son del laboratorio, no de una persona:
-      una orden sale cuando llega el repuesto y el cliente autoriza, no solo cuando el técnico termina.</p>
+      ${tecFiltrado
+        ? `<p class="hint" style="margin-top:0">Solo lo que <b>${esc(tecFiltrado.nombre)}</b> movió, tocó o dejó en este periodo.
+           "Entregadas" no quiere decir que las entregó solo — trabajó en una orden que sí salió; eso depende también
+           de que llegara el repuesto y el cliente autorizara. "Quietas" son las que él dejó de últimas y nadie,
+           ni él, las ha vuelto a tocar — puede seguir sin ser su culpa.</p>`
+        : `<p class="hint" style="margin-top:0">Cómo se movió el trabajo. Estas cifras son del laboratorio, no de una persona:
+           una orden sale cuando llega el repuesto y el cliente autoriza, no solo cuando el técnico termina.</p>`}
       <div class="kpis">
-        <div class="kpi"><div class="l">Piezas que avanzaron</div><div class="v">${av.avanzaron.reduce((a,x)=>a+x.piezas,0)}</div>
-          <div class="h">${av.avanzaron.length} componente(s) subieron de fase</div></div>
+        <div class="kpi"><div class="l">Piezas que avanzaron</div><div class="v">${piezasAvanzaron}</div>
+          <div class="h">${tecFiltrado?`crédito propio · `:""}${av.avanzaron.length} componente(s) subieron de fase${tecFiltrado?" en todo el laboratorio":""}</div></div>
         <div class="kpi"><div class="l">Piezas tocadas</div><div class="v">${piezasSemana}</div>
-          <div class="h">en ${new Set(rs.map(r=>r.ordenId)).size} órdenes</div></div>
-        <div class="kpi"><div class="l">OT entregadas</div><div class="v">${entregadas}</div>
+          <div class="h">en ${new Set(rs.map(r=>r.ordenId)).size} orden(es)</div></div>
+        <div class="kpi"><div class="l">${tecFiltrado?"Órdenes que trabajó y salieron":"OT entregadas"}</div><div class="v">${entregadas}</div>
+          <div class="h">${salieronSinReparar?`${salieronSinReparar} salieron sin repararse`:"en el periodo"}</div></div>
+        <div class="kpi ${quietasDelTecnico.length?"alert":""}"><div class="l">${tecFiltrado?"Piezas que dejó, quietas":"Piezas quietas"}</div>
+          <div class="v">${piezasQuietas}</div>
           <div class="h">${(()=>{
-            const viejas = DB.ordenes.filter(o=>o.vigente!==false && /entregad/i.test(o.estado||"")
-              && (o.fechaEntrega||o.fechaIngreso) >= d && (o.fechaEntrega||o.fechaIngreso) <= h
-              && o.fechaIngreso && o.fechaIngreso < d).length;
-            return viejas ? `${viejas} venían de antes del periodo` : "en el periodo";
-          })()}</div></div>
-        <div class="kpi ${av.quietas.length?"alert":""}"><div class="l">Piezas quietas</div>
-          <div class="v">${av.quietas.reduce((a,x)=>a+(+x.piezas||0),0)}</div>
-          <div class="h">${(()=>{
-            if(!av.quietas.length) return "nada atascado";
-            const conDias = av.quietas.filter(x=>x.dias!=null);
-            return conDias.length ? `la más vieja lleva ${conDias[0].dias} día(s)`
-                                  : `${av.quietas.length} componente(s) sin movimiento`;
+            if(!quietasDelTecnico.length) return "nada atascado";
+            const conDias = quietasDelTecnico.filter(x=>x.dias!=null);
+            return conDias.length ? `la más vieja lleva ${conDias[0].dias} día(s)` : `${quietasDelTecnico.length} componente(s) sin movimiento`;
           })()}</div></div>
       </div>
       ${salieronSinReparar?`<p class="hint" style="margin:9px 0 0">Además, <b>${salieronSinReparar}</b> orden(es) salieron sin repararse: dadas de baja o no autorizadas.</p>`:""}
+      ${tecFiltrado && susOrdenes.length?`<hr class="sep">
+      <div class="eyebrow" style="margin-bottom:7px">Sus órdenes en el periodo · en qué quedó cada una</div>
+      <div class="tw"><table><thead><tr><th>OT</th><th>Componente</th><th>Llegó a</th><th>Estado en la hoja</th></tr></thead><tbody>
+      ${susOrdenes.map(({o,comps})=>comps.map(c=>{
+        const fase = NOMBRE_FASE[faseAlcanzada(c.id, h)];
+        return `<tr><td class="mono">${esc(o.ot)}</td>
+          <td>${esc(nom(DB.tiposComponente,c.tipoComponenteId))}${c.tipologiaId?" "+esc(nom(DB.tipologias,c.tipologiaId,"")):""}</td>
+          <td><span class="tag">${esc(fase)}</span></td>
+          <td>${chipEstado(o.estado)}</td></tr>`;
+      }).join("")).join("")}
+      </tbody></table></div>`:""}
     </div></div>
 
   <div class="grid g2" style="margin-bottom:14px">
@@ -3861,12 +3960,18 @@ function vSemanal(){
       no midiendo: mira ese número antes de leer los demás.
     </p>
     <div class="tw"><table>
-    <thead><tr><th>Técnico</th><th class="num">Piezas que movió</th><th class="num">Piezas tocadas</th><th class="num">Ritmo</th><th class="num">Mismo día</th><th class="num">Horas</th><th>En qué se fue el tiempo</th></tr></thead>
-    <tbody>${activos.map(t=>{
+    <thead><tr><th>Técnico</th><th class="num">Piezas que movió</th><th class="num">Piezas tocadas</th><th class="num">Ciclo</th><th class="num">Ritmo</th><th class="num">Mismo día</th><th class="num">Horas</th><th>En qué se fue el tiempo</th></tr></thead>
+    <tbody>${(()=>{
+      /* Ciclo: días hábiles entre el primer toque de una pieza (de cualquiera)
+         y el día en que ESTE técnico la llevó a Entrega. Se calcula una sola
+         vez para toda la tabla, no por fila. */
+      const ciclos = cicloPorTecnico(d, h, FD.cuarto, FD.tecnico);
+      return activos.map(t=>{
       const rr=rs.filter(r=>r.tecnicoId===t.id);
       const rep=repartoTiempo(rr,t);
       const ri=ritmos[t.id];
       const op=oportunidad(rr);
+      const ci=ciclos[t.id];
       /* Piezas distintas que tocó, según la hoja. */
       const suyos=new Set(rr.filter(r=>r.componenteId).map(r=>r.componenteId));
       let und=0; suyos.forEach(id=>{ const cc=byId(DB.componentes,id); if(cc) und+=+cc.cantidad||0; });
@@ -3879,6 +3984,7 @@ function vSemanal(){
             ${barra(rep.directo,"var(--prussian-2)")}${barra(rep.apoyo,"var(--green)")}${barra(rep.sinOrden,"var(--amber)")}${barra(rep.noProd,"#b8c4cd")}</div></td>
         <td class="num" style="font-size:16px;font-weight:600">${movio||"—"}</td>
         <td class="num">${und||"—"}</td>
+        <td class="num">${ci?`<span class="chip ${ci.mediana<=3?"c-verde":ci.mediana<=7?"c-ambar":"c-naranja"}" title="${ci.n} pieza(s) entregadas en el periodo, días hábiles de principio a fin">${ci.mediana} d</span>`:"—"}</td>
         <td class="num">${ri&&ri.n>=3
           ? `<span class="chip ${ri.ritmo<=1.15?"c-verde":ri.ritmo<=1.5?"c-ambar":"c-naranja"}" title="${ri.n} trabajos comparables">${ri.ritmo.toFixed(2)}</span>`
           : `<span class="tag" title="${ri?ri.n:0} trabajos comparables · hacen falta 3">sin base</span>`}</td>
@@ -3890,7 +3996,12 @@ function vSemanal(){
             rep.sinOrden?`${hrs(rep.sinOrden)} sin orden`:"",
             rep.noProd?`${hrs(rep.noProd)} no prod.`:""
           ].filter(Boolean).join(" · ")||"—"}</td></tr>`;
-    }).join("")}</tbody></table></div>
+    }).join("");
+    })()}</tbody></table></div>
+    <p class="hint" style="margin-top:9px"><b>Ciclo</b> son los días hábiles entre el primer toque de una pieza —de
+      cualquier técnico— y el día en que este técnico la llevó a Entrega. Si varios se turnaron la misma pieza,
+      el crédito (y el reloj) es de quien la entregó, igual que en "Piezas que movió". Sirve para ver quién tarda
+      más en cerrar de principio a fin, no solo quién movió más piezas esta semana.</p>
     <div class="cohorte-pie" style="display:flex;gap:15px;flex-wrap:wrap;margin-top:9px;font-size:12px;color:var(--ink-2)">
       <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--prussian-2);margin-right:5px"></i>Directo sobre piezas</span>
       <span><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--green);margin-right:5px"></i>Apoyo a otro cuarto</span>
@@ -4926,7 +5037,7 @@ function mListas(){
     const prox=f.filter(x=>x>=hoyISO()).slice(0,6);
     return `<p class="hint" style="margin-top:0">${f.length} cargados. Próximos: ${prox.length?prox.map(x=>fmtFecha(x)+" ("+DIAS_SEM[new Date(x+"T12:00:00").getDay()]+")").join(" · "):"ninguno"}.<br>
     Un festivo no suma horas disponibles ni aparece en “Mi semana”, así que no castiga la productividad.</p>`;})()}
-  <div class="grid g2">${L("festivos","Festivos (una fecha por línea, formato 2026-12-25)")}${L("clientes","Clientes frecuentes (opcional, para escribir órdenes a mano)")}</div>
+  <div class="grid g2">${L("festivos","Festivos (una fecha por línea, formato 2026-12-25)")}</div>
   <hr class="sep">
   <div class="eyebrow" style="margin-bottom:9px">Horario del laboratorio · minutos pagados por día</div>
   <div class="row">${[1,2,3,4,5,6,0].map(d=>`<label class="f" style="flex:1 1 90px"><span>${nd[d].slice(0,3)}</span>
@@ -4940,11 +5051,6 @@ function mListas(){
     <label class="f" style="max-width:280px"><span>¿Descontar el break?</span>
       <select id="brkOn"><option value="1" ${h.descontarBreak?"selected":""}>Sí — no cuenta como producción</option>
       <option value="0" ${!h.descontarBreak?"selected":""}>No — cuenta dentro de la jornada</option></select></label>
-    <label class="f" style="max-width:330px"><span>Captura del tiempo</span>
-      <select id="captura">
-        <option value="simple" ${(DB.meta.capturaTiempo||"simple")==="simple"?"selected":""}>El técnico escribe su tiempo en cada actividad</option>
-        <option value="detallado" ${DB.meta.capturaTiempo==="detallado"?"selected":""}>Detallado — el técnico escribe los minutos de cada actividad</option>
-      </select></label>
   </div>
   <p class="hint" style="margin-top:-4px">Semana: <b class="mono">${hrs(totalBruto)} h</b> pagadas · <b class="mono">${hrs(totalNeto)} h</b> disponibles para producción.
   La clave solo evita entradas por descuido al perfil de coordinación; no es seguridad real.</p>
@@ -5126,125 +5232,15 @@ function pMaestros(){
     const dias={}; document.querySelectorAll("[data-dia]").forEach(i=>dias[i.dataset.dia]=Math.max(0,+i.value||0));
     const cierran=[...document.querySelectorAll("[data-cierra]")].filter(i=>i.checked).map(i=>i.dataset.cierra);
     const brk=Math.max(0,+$("#brk").value||0), brkOn=$("#brkOn").value==="1";
-    const cap=$("#captura").value, dr=Math.max(0,+$("#diasRetro").value||0), isem=+$("#iniSem").value||0;
-    commitMaestro(()=>{ Object.assign(DB,vals); DB.meta.horario={dias, breakMin:brk, descontarBreak:brkOn}; DB.meta.capturaTiempo=cap; DB.meta.diasRetro=dr; DB.meta.inicioSemana=isem; DB.estadosCerrados=cierran; },"Guardado");
+    const dr=Math.max(0,+$("#diasRetro").value||0), isem=+$("#iniSem").value||0;
+    commitMaestro(()=>{ Object.assign(DB,vals); DB.meta.horario={dias, breakMin:brk, descontarBreak:brkOn}; DB.meta.diasRetro=dr; DB.meta.inicioSemana=isem; DB.estadosCerrados=cierran; },"Guardado");
   };
 }
 
 /* =========================================================================
    VISTA 6 · DATOS (importar / exportar / respaldo)
    ========================================================================= */
-let IMP={texto:"",filas:[],map:{},sep:"\t"};
 /* ---- Importar la tabla de tiempos de la empresa ---- */
-let IMPE={texto:"",filas:[],map:{},unidad:"min"};
-const CAMPOS_E=[["ignorar","(ignorar)"],["cuarto","Cuarto"],["componente","Tipo de componente"],["tipologia","Tipología"],["actividad","Actividad"],["tiempo","Tiempo"],["aparte","¿Aparte del proceso?"]];
-function aMinutos(v, unidad){
-  const t=String(v||"").trim().replace(",",".");
-  if(!t) return 0;
-  if(t.includes(":")){ const [h,m]=t.split(":"); return (parseInt(h,10)||0)*60+(parseInt(m,10)||0); }
-  const num=parseFloat(t.replace(/[^\d.]/g,""))||0;
-  if(/h/i.test(t) || unidad==="h") return Math.round(num*60);
-  return Math.round(num);
-}
-function vImportEstandares(){
-  return `
-  <div class="card"><header><h2>Cargar tabla de tiempos estándar</h2></header><div class="body">
-    <p class="hint" style="margin-top:0">Copia el bloque de tu hoja de tiempos (con encabezados) y pégalo aquí. Crea sola los componentes, tipologías y actividades que falten.</p>
-    <textarea id="pegadoE" style="min-height:120px;font-family:var(--mono);font-size:12px" placeholder="Pega aquí (Ctrl+V)…">${esc(IMPE.texto)}</textarea>
-    <div class="row" style="margin-top:10px">
-      <label class="f" style="max-width:230px"><span>Los tiempos vienen en</span>
-        <select id="unidadE"><option value="min" ${IMPE.unidad==="min"?"selected":""}>Minutos</option>
-        <option value="h" ${IMPE.unidad==="h"?"selected":""}>Horas (1.5 o 1:30)</option></select></label>
-      <div style="flex:0 0 auto;align-self:end;margin-bottom:11px">
-        <button class="btn primary" id="leerE">Leer</button>
-        <button class="btn" id="limpiarE">Limpiar</button></div>
-    </div>
-    ${IMPE.filas.length?`<hr class="sep"><div class="eyebrow" style="margin-bottom:9px">Asigna las columnas · ${IMPE.filas.length-1} filas</div>
-      <div class="tw"><table><thead><tr>${IMPE.filas[0].map((h,i)=>`<th><select data-mape="${i}">${CAMPOS_E.map(([v,l])=>`<option value="${v}" ${IMPE.map[i]===v?"selected":""}>${l}</option>`).join("")}</select><div class="tag" style="margin-top:4px">${esc(h)}</div></th>`).join("")}</tr></thead>
-      <tbody>${IMPE.filas.slice(1,4).map(f=>`<tr>${IMPE.filas[0].map((_,i)=>`<td class="tag">${esc(f[i]||"")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
-      <button class="btn primary" id="importarE" style="margin-top:11px">Importar tiempos</button>`:""}
-    <p class="hint" style="margin-top:11px">Si tu tabla tiene <b>un solo tiempo por componente</b> —como “REPARACIÓN TOTAL INYECTORES CR = 1 h”— deja la columna Actividad en “ignorar”: entra como <b>tiempo total del proceso</b>, y cada paso toma su porcentaje según el <b>Reparto del proceso</b> de Maestros. Es la forma correcta de repartir una hora entre las cuatro personas que tocan el inyector.</p>
-  </div></div>`;
-}
-function pImportEstandares(){
-  const t=$("#pegadoE"); if(!t) return;
-  t.oninput=e=>IMPE.texto=e.target.value;
-  $("#unidadE").onchange=e=>IMPE.unidad=e.target.value;
-  $("#leerE").onclick=()=>{
-    const txt=IMPE.texto.trim(); if(!txt){toast("Pega algo primero");return;}
-    const sep = txt.split("\n")[0].includes("\t") ? "\t" : ",";
-    IMPE.filas = txt.split("\n").map(l=>partir(l,sep)).filter(f=>f.join("").trim()!=="");
-    IMPE.map={};
-    IMPE.filas[0].forEach((h,i)=>{
-      const k=String(h||"").toLowerCase();
-      if(/cuarto|secci|area|área/.test(k)) IMPE.map[i]="cuarto";
-      else if(/component|element|pieza|item|descrip/.test(k)) IMPE.map[i]="componente";
-      else if(/tipolog|aplicaci|motor|modelo|referencia|sistema/.test(k)) IMPE.map[i]="tipologia";
-      else if(/activ|proceso|operaci|trabajo/.test(k)) IMPE.map[i]="actividad";
-      else if(/tiempo|min|hora|dura|estand|estánd/.test(k)) IMPE.map[i]="tiempo";
-      else IMPE.map[i]="ignorar";
-    });
-    render();
-  };
-  $("#limpiarE").onclick=()=>{IMPE={texto:"",filas:[],map:{},unidad:IMPE.unidad};render();};
-  document.querySelectorAll("[data-mape]").forEach(s=>s.onchange=()=>{IMPE.map[+s.dataset.mape]=s.value;});
-  const imp=$("#importarE"); if(imp) imp.onclick=importarEstandares;
-}
-function importarEstandares(){
-  const idx={}; Object.entries(IMPE.map).forEach(([i,c])=>{ if(c!=="ignorar") idx[c]=+i; });
-  if(idx.componente===undefined || idx.tiempo===undefined){ toast("Faltan las columnas de Componente y Tiempo"); return; }
-  /* se copian antes: commitMaestro es asíncrono y IMPE se limpia después */
-  const filas = IMPE.filas.slice(1);
-  const unidad = IMPE.unidad;
-  const cont = {nuevos:0, actualizados:0, actividades:0, componentes:0};
-  commitMaestro(()=>{
-    filas.forEach(f=>{
-      const cn=String(f[idx.componente]||"").trim(); if(!cn) return;
-      const min=aMinutos(f[idx.tiempo], unidad); if(!min) return;
-      /* cuarto */
-      let cuartoId = DB.cuartos[0] && DB.cuartos[0].id;
-      if(idx.cuarto!==undefined && f[idx.cuarto]){
-        const cu=buscarOCrear("cuartos", String(f[idx.cuarto]).trim(), {tipo:"principal",grupo:""});
-        cuartoId=cu.id;
-      }
-      /* componente */
-      let tipo = DB.tiposComponente.find(x=>x.nombre.trim().toLowerCase()===cn.toLowerCase());
-      if(!tipo){ tipo={id:uid("tc"), nombre:cn, cuartoId}; DB.tiposComponente.push(tipo); cont.componentes++; }
-      else if(idx.cuarto!==undefined && f[idx.cuarto]) tipo.cuartoId=cuartoId;
-      /* tipología */
-      const tn = idx.tipologia!==undefined ? String(f[idx.tipologia]||"").trim() : "";
-      const tip = (tn && !/^(todas|todos|general|n\/a|-)$/i.test(tn))
-        ? buscarOCrear("tipologias", tn, {cuartoId:tipo.cuartoId, tipoComponenteId:""}) : null;
-      /* actividad */
-      const an = idx.actividad!==undefined ? String(f[idx.actividad]||"").trim() : "";
-      let act;
-      if(an){
-        act = DB.actividades.find(x=>x.nombre.trim().toLowerCase()===an.toLowerCase());
-        if(!act){ act={id:uid("ac"), nombre:an, orden:(Math.max(0,...DB.actividades.map(a=>a.orden))+1), fase:"Reparación", cuartos:[tipo.cuartoId]};
-          DB.actividades.push(act); cont.actividades++; }
-        else if(Array.isArray(act.cuartos) && act.cuartos.length && !act.cuartos.includes(tipo.cuartoId)) act.cuartos.push(tipo.cuartoId);
-      } else {
-        act = {id:ACT_TOTAL};   /* sin actividad = tiempo total del proceso */
-      }
-      /* estándar (uno por combinación) */
-      const tipId = tip? tip.id : "*";
-      /* Columna opcional: marca las alternativas que no suman al proceso
-         (montaje de cartridge en vez de armar, mantenimiento suelto). */
-      const ap = idx.aparte!==undefined && /^(s[ií]|1|x|true|aparte)$/i.test(String(f[idx.aparte]||"").trim());
-      const ya = DB.estandares.find(e=>e.tipoComponenteId===tipo.id && e.tipologiaId===tipId && e.actividadId===act.id);
-      if(ya){ ya.minutos=min; ya.aparte=ap; cont.actualizados++; }
-      else { DB.estandares.push({id:uid("es"), tipoComponenteId:tipo.id, tipologiaId:tipId, actividadId:act.id, minutos:min, aparte:ap}); cont.nuevos++; }
-    });
-  }).then(()=>{
-    toast(`${cont.nuevos} tiempos nuevos · ${cont.actualizados} actualizados · ${cont.componentes} componentes y ${cont.actividades} actividades creadas`);
-    IMPE={texto:"",filas:[],map:{},unidad};
-    render();
-  });
-}
-
-/* Revisión previa: qué falta para que los indicadores funcionen. */
-/* Registros que quedaron sin poder valorarse: sin componente ni foto, o con
-   una actividad que ya no existe. Son los que "no ganan horas" en el informe. */
 function registrosRotos(){
   const rs=RA();
   return {
@@ -5779,21 +5775,12 @@ function vDatos(){
     <p class="hint" style="margin-bottom:0">Piensa en esto como el embudo del laboratorio: la hoja sigue siendo tu fuente de órdenes, la app se encarga del tiempo y la mano de obra.</p>
   </div></details>
 
-  <div class="card"><header><h2>Pegar desde Google Sheets</h2></header><div class="body">
-    <textarea id="pegado" style="min-height:130px;font-family:var(--mono);font-size:12px" placeholder="Pega aquí (Ctrl+V)…">${esc(IMP.texto)}</textarea>
-    <div class="row" style="margin-top:10px"><div style="flex:0 0 auto">
-      <button class="btn primary" id="leer">Leer</button>
-      <button class="btn" id="limpiarImp">Limpiar</button></div></div>
-    ${IMP.filas.length?mapeo():""}
-  </div></div>
-
   ${panelChequeos()}
 
   ${panelManuales()}
 
   ${panelReparar()}
 
-  ${vImportEstandares()}
 
   <div class="card"><header><h2>Respaldo</h2><span class="sub mono">${DB.registros.length} registros · ${DB.tecnicos.length} técnicos</span></header><div class="body">
     <p class="hint" style="margin-top:0">Tu red de seguridad. Descárgalo cada viernes y cada vez que termines de cargar maestros.</p>
@@ -5887,40 +5874,8 @@ function camposMapeo(){
   return base.concat(DB.tiposComponente.map(t=>["comp:"+t.id,"Cantidad · "+t.nombre]));
 }
 Object.defineProperty(window,"CAMPOS",{get:camposMapeo});
-function mapeo(){
-  const enc=IMP.filas[0];
-  return `<hr class="sep"><div class="eyebrow" style="margin-bottom:9px">Asigna las columnas · ${IMP.filas.length-1} filas detectadas</div>
-  <div class="tw"><table><thead><tr>${enc.map((h,i)=>`<th><select data-map="${i}">${CAMPOS.map(([v,l])=>`<option value="${v}" ${IMP.map[i]===v?"selected":""}>${l}</option>`).join("")}</select><div class="tag" style="margin-top:4px">${esc(h)}</div></th>`).join("")}</tr></thead>
-  <tbody>${IMP.filas.slice(1,4).map(f=>`<tr>${enc.map((_,i)=>`<td class="tag">${esc(f[i]||"")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
-  <button class="btn primary" id="importar" style="margin-top:11px">Importar</button>`;
-}
 function pDatos(){
   pRepararRegistros();
-  $("#pegado").oninput=e=>IMP.texto=e.target.value;
-  $("#leer").onclick=()=>{
-    const txt=IMP.texto.trim(); if(!txt){toast("Pega algo primero");return;}
-    const sep = txt.split("\n")[0].includes("\t") ? "\t" : ",";
-    IMP.sep=sep;
-    IMP.filas = txt.split("\n").map(l=>partir(l,sep));
-    IMP.map=detectarMapa(IMP.filas[0], IMP.filas.slice(1,40));
-    if(false) IMP.filas[0].forEach((h,i)=>{
-      const k=h.toLowerCase();
-      if(/(^ot$|orden|n[°o]|numero)/.test(k)) IMP.map[i]="ot";
-      else if(/cliente|empresa/.test(k)) IMP.map[i]="cliente";
-      else if(/fecha|ingreso/.test(k)) IMP.map[i]="fechaIngreso";
-      else if(/estado|status/.test(k)) IMP.map[i]="estado";
-      else if(/component|element|descrip|item/.test(k)) IMP.map[i]="componente";
-      else if(/tipolog|modelo|referencia|sistema/.test(k)) IMP.map[i]="tipologia";
-      else if(/cant|qty|und/.test(k)) IMP.map[i]="cantidad";
-      else if(/obs|nota|coment/.test(k)) IMP.map[i]="obs";
-      else IMP.map[i]="ignorar";
-    });
-    render();
-  };
-  $("#limpiarImp").onclick=()=>{IMP={texto:"",filas:[],map:{},sep:"\t"};render();};
-  document.querySelectorAll("[data-map]").forEach(s=>s.onchange=()=>{IMP.map[+s.dataset.map]=s.value;});
-  const imp=$("#importar"); if(imp) imp.onclick=importar;
-  pImportEstandares();
   $("#expReg").onclick=()=>exportarCSV(RA());
   $("#expOrd").onclick=exportarOrdenes;
   $("#expJson").onclick=()=>{ bajar("respaldo_laboratorio_"+hoyISO()+".json", JSON.stringify(DB,null,2),"application/json");
@@ -6137,6 +6092,7 @@ function aplicarFilas(filas, mapa){
   const sinComponente=[];
   const avisos=[];
   const nuevosEstados=[];
+  const cerr = cerrados();
   /* Si el mapeo apunta a un componente que ya no existe (lo borraste o
      renombraste), se busca el equivalente por el nombre de la columna. */
   /* La fila de encabezados no siempre es la primera. El puente hace
@@ -6237,7 +6193,15 @@ function aplicarFilas(filas, mapa){
         if(!basura){
           let m=DB.estados.find(x=>x.toLowerCase()===e.toLowerCase());
           if(!m){ DB.estados.push(e); m=e; nuevosEstados.push(e); }
+          /* Se guarda el día en que la orden pasó a cerrada, la PRIMERA vez.
+             Sirve para darle al técnico un día de gracia antes de que la
+             orden desaparezca de su lista — si coordinación la marca
+             Entregado a media mañana, quien la estaba trabajando alcanza a
+             registrar lo que hizo esa tarde sin que ya no la encuentre. */
+          const estabaAbierta = !cerr.has(o.estado);
           o.estado=m;
+          if(estabaAbierta && cerr.has(m) && !o.cerroEn) o.cerroEn=hoyISO();
+          else if(!cerr.has(m)) o.cerroEn=null;   /* si reabre, se olvida la fecha */
         }
       }
       if(idx.obs!==undefined && f[idx.obs]) o.obs=f[idx.obs];
@@ -6339,7 +6303,12 @@ function aplicarFilas(filas, mapa){
               }
             } else { c2={id:idComponente(o.id,entry.tipo.id),ordenId:o.id,tipoComponenteId:entry.tipo.id,
               tipologiaId:tipUnico, tipMezcla:esMezcla, desglose:esMezcla?desgloseArr:null,
-              cantidad:acum[entry.tipo.id], cuartoId:entry.tipo.cuartoId,
+              /* El cuarto es el de ESTA fila de la hoja, no el que quedó fijo en
+                 Maestros para el tipo. Una bomba de transferencia que llega en
+                 una orden de Unitario pertenece a Unitario, aunque el tipo
+                 "Transferencia" tenga configurado Electrónico como su cuarto
+                 más común — eso es solo dónde SUELE aparecer, no una regla. */
+              cantidad:acum[entry.tipo.id], cuartoId:cuartoOT||entry.tipo.cuartoId,
               estado:o.estado, serie:"", origen:"hoja"}; DB.componentes.push(c2); nC++; }
             c2.origen=c2.origen||"hoja";
             creados.push(c2);
@@ -6385,9 +6354,11 @@ function aplicarFilas(filas, mapa){
              haya agregado alguien a mano. */
           if(r.tip && comp.origen!=="manual" && comp.tipologiaId!==r.tip.id) comp.tipologiaId=r.tip.id;
           else if(r.tip && !comp.tipologiaId) comp.tipologiaId=r.tip.id;
-          comp.cuartoId=tipo.cuartoId; }
+          /* El cuarto es el de esta fila, no el que quedó fijo en Maestros
+             para el tipo — mismo criterio que en el reparto explícito. */
+          comp.cuartoId=cuartoOT||tipo.cuartoId; }
         else { comp={id:idComponente(o.id,tipo.id),ordenId:o.id,tipoComponenteId:tipo.id,tipologiaId:r.tip?r.tip.id:null,
-          cantidad:acum[tipo.id], cuartoId:tipo.cuartoId, estado:o.estado, serie:"", origen:"hoja"}; DB.componentes.push(comp); nC++; }
+          cantidad:acum[tipo.id], cuartoId:cuartoOT||tipo.cuartoId, estado:o.estado, serie:"", origen:"hoja"}; DB.componentes.push(comp); nC++; }
         comp.origen = comp.origen || "hoja";
         creados.push(comp);
       });
@@ -6452,20 +6423,6 @@ function aplicarFilas(filas, mapa){
     [...new Set(sinComponente)].join(", ")+". Créalos en Maestros → Tipos de componente y asígnalos en Probar conexión.");
   return {nOT,nC,nAct,omitidas,sinFecha,porRevisar,depurados,multi,repetidas,adoptadas,reasignadas,avisos,fueraVigencia,
     nuevosEstados:[...new Set(nuevosEstados)]};
-}
-function importar(){
-  const filas = IMP.filas.slice();
-  const mapa = Object.assign({}, IMP.map);
-  if(!Object.values(mapa).includes("ot")){ toast("Falta asignar la columna de OT"); return; }
-  let res;
-  commitMaestro(()=>{ res = aplicarFilas(filas, mapa); }).then(()=>{
-    toast(res && !res.error
-      ? `${res.nOT} órdenes nuevas · ${res.nAct} actualizadas · ${res.nC} componentes`
-        + (res.omitidas?` · ${res.omitidas} anteriores al corte`:"")
-      : (res && res.error) || "Importado");
-    IMP={texto:"",filas:[],map:{},sep:"\t"};
-    render();
-  });
 }
 /* Quita el BOM y espacios que agregan el Bloc de notas o Excel al copiar. */
 function limpiarJson(t){ return String(t==null?"":t).replace(/^\uFEFF/,"").trim(); }
@@ -7092,14 +7049,17 @@ function vConexion(){
   return `
   <div class="card"><header><h2>Conexión con la hoja</h2>
     <span class="sub mono">${cx.modo?("último: "+(cx.ultimaSync?new Date(cx.ultimaSync).toLocaleString():"nunca")):"sin configurar"}</span>
-    <div class="push">${cx.modo?`<button class="btn sm primary" id="auditarCx">Auditar cantidades</button>
-      <button class="btn sm" id="rastrearOT">Rastrear una OT</button>
-      <button class="btn sm warn" id="rehacerTodo">Rehacer componentes</button>
+    <div class="push">${cx.modo?`<button class="btn sm warn" id="rehacerTodo">Rehacer componentes</button>
       <button class="btn sm" id="depurarCx">Depurar órdenes</button>
       <button class="btn sm" id="probarCx">Probar conexión</button>
       <button class="btn primary sm" id="syncYa">Sincronizar ahora</button>`:""}</div></header>
     <div class="body">
-      ${cx.ultimoError?`<div style="border:1px solid #eec4c1;background:#fbecea;color:var(--red);padding:9px 11px;border-radius:var(--r);margin-bottom:12px;font-size:13px">${esc(cx.ultimoError)}</div>`:""}
+    ${cx.modo?`<details style="margin-bottom:12px"><summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-2)">Herramientas avanzadas</summary>
+      <div style="padding-top:9px">
+        <p class="hint" style="margin-top:0">Para cuando algo no cuadra: revisar de dónde salió un número, o seguirle la pista a una orden puntual.</p>
+        <button class="btn sm" id="auditarCx">Auditar cantidades</button>
+        <button class="btn sm" id="rastrearOT">Rastrear una OT</button>
+      </div></details>`:""}      ${cx.ultimoError?`<div style="border:1px solid #eec4c1;background:#fbecea;color:var(--red);padding:9px 11px;border-radius:var(--r);margin-bottom:12px;font-size:13px">${esc(cx.ultimoError)}</div>`:""}
       ${(cx.ultimoResumen&&(cx.ultimoResumen.avisos||[]).length)?`<div style="border:1px solid #f3ccb0;background:#fdefe5;color:var(--signal);padding:10px 12px;border-radius:var(--r);margin-bottom:12px;font-size:13px">
         <b>Componentes configurados en la sala equivocada:</b><br>
         ${cx.ultimoResumen.avisos.map(a=>"· "+esc(a)).join("<br>")}<br>

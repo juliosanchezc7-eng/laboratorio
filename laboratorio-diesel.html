@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-07 · v59";
+const VERSION_APP = "2026-09-08 · v61";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -1084,6 +1084,23 @@ function estaCerrada(o){ return cerrados().has(o.estado); }
 /* Cuarto de una orden: por sus componentes, o deducido del propio número de OT
    (tus OT vienen como "36093-Electrónico"). */
 function sinTildes(x){ return String(x==null?"":x).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,""); }
+
+/* Google Sheets, sobre todo a través de IMPORTRANGE, a veces trae caracteres
+   invisibles en los encabezados: espacios de no separación (\u00A0), espacios
+   de ancho cero, marcas de orden de bytes al inicio de la celda. Se ven
+   IDÉNTICOS en pantalla a un espacio normal, pero rompen cualquier
+   comparación exacta o expresión regular que espere texto limpio — el
+   encabezado "parece" igual pero nunca coincide con nada.
+   Esta función los normaliza a un espacio común antes de que cualquier otra
+   parte del código intente reconocer o comparar el texto. */
+function limpiarEncabezado(x){
+  return String(x==null?"":x)
+    .normalize("NFKC")
+    .replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, " ")
+    .replace(/[^\S\n]/g, m => m===" " ? " " : "")   /* cualquier otro espacio raro desaparece */
+    .replace(/\s+/g, " ")
+    .trim();
+}
 /* Una OT puede tener componentes de varios cuartos (inyectores + un turbo).
    Devuelve TODOS los cuartos a los que pertenece, no solo el primero. */
 /* Familia = a qué grupo pertenece un tipo de componente. Permite que la columna
@@ -5381,7 +5398,7 @@ function panelChequeos(){
    Siempre se muestra lo detectado antes de aplicar nada.
 -------------------------------------------------------------------------- */
 function detectarColumnasRegistros(filas){
-  const enc = (filas[0]||[]).map(h=>sinTildes(String(h||"")).trim());
+  const enc = (filas[0]||[]).map(h=>limpiarEncabezado(sinTildes(String(h||""))));
   const tiene = n=>enc.indexOf(n);
   if(tiene("id")>=0 && tiene("ot")>=0){
     return {desdeFila:1, id:tiene("id"), ot:tiene("ot"), componente:tiene("componente"),
@@ -5970,12 +5987,15 @@ function buscarOCrear(col, nombre, extra){
    posiciones viejas desde que la hoja cambió de estructura. */
 /* v9: reconoce TECNICO y NOVEDAD, y ahora el mapa se reconstruye solo cuando
    la hoja cambia de estructura, aunque esté fijado a mano. */
-const DETECTOR = 9;
+/* v10: los encabezados se limpian de caracteres invisibles antes de
+   compararlos o reconocerlos, y una sincronización que no encuentra una fila
+   de encabezados confiable ya no sobrescribe el mapa bueno con uno peor. */
+const DETECTOR = 10;
 function detectarMapa(enc, filasMuestra){
   const map={};
   const porNombre=n=>{ const t=DB.tiposComponente.find(x=>x.nombre.toLowerCase().indexOf(n)>=0); return t?("comp:"+t.id):null; };
   enc.forEach((h,i)=>{
-    const k=String(h||"").toLowerCase().replace(/\./g,"").trim();
+    const k=limpiarEncabezado(h).toLowerCase().replace(/\./g,"").trim();
     let v="ignorar";
     const esCumplimiento = /cumplim|a\s*tiempo|atras|oportun|sla|vencim/.test(k);
     if(/^garant/.test(k)){ map[i]="garantia"; return; }
@@ -6053,7 +6073,7 @@ function detectarMapa(enc, filasMuestra){
   });
   /* Ajustes que fijó el usuario: se aplican al final y mandan sobre todo. */
   const fijos=(DB.meta.conexion&&DB.meta.conexion.fijos)||null;
-  if(fijos) enc.forEach((h,i)=>{ const k=sinTildes(String(h||"")); if(fijos[k]) map[i]=fijos[k]; });
+  if(fijos) enc.forEach((h,i)=>{ const k=limpiarEncabezado(sinTildes(String(h||""))); if(fijos[k]) map[i]=fijos[k]; });
   const co=Object.keys(map).filter(i=>map[i]==="ot");
   if(co.length>1){
     const buena = co.find(i=>/^(ot|orden)$/.test(sinTildes(enc[i]).trim()))
@@ -6102,7 +6122,11 @@ function aplicarFilas(filas, mapa){
      Se aplica a cualquier fuente: puente, CSV o pegado. */
   filas = recortarEncabezado(filas);
   const enc = filas[0]||[];
+  /* Se guardan las dos versiones: la cruda (para poder mostrarla y detectar
+     si trae algo invisible) y la limpia (la que de verdad se usa para leer
+     la hoja). Si difieren, es la prueba de que hay un carácter escondido. */
   DB.meta.encabezadosVistos = enc.map(x=>String(x==null?"":x).trim());
+  DB.meta.encabezadosLimpios = enc.map(x=>limpiarEncabezado(String(x==null?"":x)));
   const compCols = Object.entries(mapa)
     .filter(([,v])=>String(v).indexOf("comp:")===0)
     .map(([i,v])=>{
@@ -6669,6 +6693,30 @@ async function sincronizar(silencioso){
     const {filas, registros, config} = await leerFuente();
     let remapeado=false;
 
+    /* Si ninguna de las primeras filas se parece de verdad a un encabezado
+       (nada contiene "ORDEN"), no hay de dónde sacar una fila 0 confiable.
+       Puede ser una lectura a medio hacer de Google, un IMPORTRANGE que
+       todavía no terminó de recalcular, o que alguien de verdad movió o
+       borró la fila de encabezados en PROGRAMACION.
+       Antes, en este caso, la app igual seguía adelante tratando una fila de
+       DATOS como si fueran encabezados — y como eso vuelve a fallar en la
+       siguiente sincronización también, cada intento de "arreglarse solo"
+       terminaba sobrescribiendo el último mapa bueno con uno igual de malo.
+       Ahora, si no hay confianza, no se toca nada: ni el mapa, ni los
+       encabezados guardados, ni las órdenes. Es tratarlo como si la
+       sincronización hubiera fallado, porque en la práctica así es. */
+    const seVeComoEncabezado = arr => (arr||[]).some(c=>/ORDEN/.test(sinTildes(limpiarEncabezado(String(c||""))).toUpperCase()));
+    if(filas.length && !seVeComoEncabezado(filas[0])){
+      cx.ultimoError = "No se encontró la fila de encabezados en tu hoja esta vez — no se tocó nada. "
+        +"Si vuelve a pasar, revisa que ORDEN, CUARTO, TIPO y las demás columnas sigan en las primeras filas "
+        +"de PROGRAMACION; puede ser también un IMPORTRANGE que aún no terminaba de cargar.";
+      await guardar();
+      SYNC.corriendo=false;
+      if(!silencioso) toast("No se pudo confirmar la estructura de la hoja — nada se modificó");
+      render();
+      return;
+    }
+
     /* Si alguien inserta o quita una columna en PROGRAMACION, el mapa
        guardado —fijado a mano o no— pasa a apuntar a la columna equivocada,
        y lo hace EN SILENCIO: nada avisa, los datos simplemente empiezan a
@@ -6683,7 +6731,7 @@ async function sincronizar(silencioso){
        seguir leyendo silenciosamente mal. Los ajustes en "fijos" no se
        pierden: se aplican por el NOMBRE de la columna, no por su posición,
        así que sobreviven intactos a cualquier reordenamiento. */
-    const normEnc = arr => (arr||[]).map(h=>sinTildes(String(h||"")).trim().toUpperCase());
+    const normEnc = arr => (arr||[]).map(h=>limpiarEncabezado(sinTildes(String(h||""))).toUpperCase());
     const encActual = normEnc(filas[0]);
     const encAnterior = normEnc(cx.mapaEncabezados);
     const cambioEstructura = !!(filas.length && (
@@ -6718,7 +6766,7 @@ async function sincronizar(silencioso){
        Se aplican por nombre de columna, así que siguen valiendo aunque la
        hoja se haya reordenado. */
     if(filas.length && cx.fijos){
-      filas[0].forEach((h,i)=>{ const k=sinTildes(String(h||"")); if(cx.fijos[k]) cx.mapa[i]=cx.fijos[k]; });
+      filas[0].forEach((h,i)=>{ const k=limpiarEncabezado(sinTildes(String(h||""))); if(cx.fijos[k]) cx.mapa[i]=cx.fijos[k]; });
     }
     let res={nOT:0,nAct:0}, adopto=false;
     await commit(()=>{
@@ -7215,6 +7263,7 @@ function vConexion(){
            solo se podía descubrir leyendo el código. */
         const mp = cx.mapa; if(!mp) return "";
         const enc = DB.meta.encabezadosVistos || [];
+        const encLimpios = DB.meta.encabezadosLimpios || [];
         if(!enc.length) return `<p class="hint" style="margin-top:12px">Sincroniza una vez para ver cómo se está leyendo tu hoja.</p>`;
         const filas = enc.map((h,i)=>{
           const v = mp[i] || "ignorar";
@@ -7225,18 +7274,29 @@ function vConexion(){
             destino = t ? `${t.nombre} · ${nom(DB.cuartos,t.cuartoId,"sin cuarto")}` : "componente que ya no existe";
             alerta = !t;
           } else destino = v;
-          return {h, destino, alerta};
+          /* Si la versión "limpia" (sin caracteres invisibles) es distinta de
+             lo que se ve en pantalla, hay algo escondido en el texto — un
+             espacio de no separación, un carácter de ancho cero — que rompe
+             cualquier comparación exacta aunque a simple vista se vea normal. */
+          const limpio = encLimpios[i] || "";
+          const tieneInvisibles = limpio !== h;
+          return {h, destino, alerta, tieneInvisibles, limpio};
         });
         const malas = filas.filter(x=>x.alerta).length;
+        const conInvisibles = filas.filter(x=>x.tieneInvisibles);
         return `<hr class="sep">
         <div class="eyebrow" style="margin-bottom:4px">Cómo se está leyendo tu hoja</div>
         <p class="hint" style="margin:0 0 8px">Si a un técnico no le aparece un componente, míralo aquí primero:
         casi siempre su columna quedó sin mapear. Un componente puede tener el cuarto de Electrónico y aun así
         usarse en Unitario — la app lo reubica según el cuarto de la orden.</p>
+        ${conInvisibles.length?`<div style="border:1px solid #f3ccb0;background:#fdefe5;color:var(--signal);padding:9px 11px;border-radius:var(--r);margin-bottom:9px;font-size:13px">
+          <b>${conInvisibles.length} columna(s) traen un carácter invisible</b> — se ven normales, pero no coinciden
+          con nada. Suele pasar con hojas que llegan por IMPORTRANGE. Debajo se muestra el texto real, entre comillas,
+          para que se vea la diferencia.</div>`:""}
         ${malas?`<div style="border:1px solid #f3ccb0;background:#fdefe5;color:var(--signal);padding:9px 11px;border-radius:var(--r);margin-bottom:9px;font-size:13px">
           <b>${malas} columna(s) de componente sin destino.</b> Pulsa “Rehacer mapeo de columnas” y sincroniza.</div>`:""}
         <div class="tw"><table><thead><tr><th>Columna de la hoja</th><th>La app la lee como</th></tr></thead><tbody>
-        ${filas.map(x=>`<tr><td class="mono">${esc(x.h)}</td>
+        ${filas.map(x=>`<tr><td class="mono">${esc(x.h)}${x.tieneInvisibles?`<br><span class="chip c-naranja" title="Texto real, con lo invisible a la vista">"${esc(JSON.stringify(x.h).slice(1,-1))}"</span>`:""}</td>
           <td${x.alerta?' style="color:var(--signal);font-weight:600"':""}>${esc(x.destino)}</td></tr>`).join("")}
         </tbody></table></div>`;
       })()}

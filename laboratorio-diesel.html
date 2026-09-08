@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-07 · v58";
+const VERSION_APP = "2026-09-07 · v59";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -6693,13 +6693,22 @@ async function sincronizar(silencioso){
 
     if(filas.length) cx.encabezados = filas[0];
 
-    if(filas.length && (!cx.mapa || cambioEstructura || (cx.mapaVersion!==DETECTOR && !cx.mapaManual))){
+    /* Un mapa sin columna de OT nunca es válido — no hay ambigüedad posible
+       aquí, a diferencia de un cambio de estructura donde algo podría seguir
+       sirviendo. Si pasa (mapa corrupto de una sincronización vieja, un
+       ajuste manual que se fue por mal camino, cualquier causa futura que no
+       se haya anticipado), se reconstruye solo en la siguiente sincronización
+       en vez de esperar a que alguien note que nada se está leyendo y busque
+       el botón correcto. */
+    const mapaSinOT = cx.mapa && !Object.values(cx.mapa).includes("ot");
+
+    if(filas.length && (!cx.mapa || cambioEstructura || mapaSinOT || (cx.mapaVersion!==DETECTOR && !cx.mapaManual))){
       const eraManual = cx.mapaManual;
       cx.mapa = detectarMapa(filas[0], filas.slice(1,40));
       cx.mapaVersion = DETECTOR;
       cx.mapaEncabezados = filas[0];
       remapeado=true;
-      if(cambioEstructura && eraManual){
+      if((cambioEstructura||mapaSinOT) && eraManual){
         cx.mapaManual = false;
         cx.avisoRemapeoEstructural = { fecha: new Date().toISOString(),
           antes: (cx.mapaEncabezados||[]).length, ahora: filas[0].length };

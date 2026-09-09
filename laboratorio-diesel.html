@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-08 · v61";
+const VERSION_APP = "2026-09-09 · v62";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -2328,8 +2328,7 @@ function pasoOrden(){
     .sort((a,b)=> (b.fechaIngreso||"").localeCompare(a.fechaIngreso||"") );
 
   const cerradas = DB.ordenes.length - abiertas.length;
-  const minFecha = (esCoordinador()||!DB.meta.diasRetro) ? "" :
-    restarDias(hoyISO(), DB.meta.diasRetro);
+  const minFecha = (esCoordinador()||!DB.meta.diasRetro) ? "" : fechaMinimaRegistro();
 
   return `
   <div class="card">
@@ -4388,7 +4387,7 @@ function modalSinOrden(){
   const opciones=DB.actividades.filter(a=>a.noProductiva)
     .concat(DB.actividades.filter(a=>!a.noProductiva && /apoyo|capacit|reuni|mantenimiento de equipo/i.test(a.nombre)));
   const vistas=[...new Map(opciones.map(a=>[a.id,a])).values()];
-  const maxF=hoyISO(), minF=esCoordinador()?"":restarDias(hoyISO(), DB.meta.diasRetro||2);
+  const maxF=hoyISO(), minF=esCoordinador()?"":fechaMinimaRegistro();
   abrirModal("Actividad sin orden", `
     <p class="hint" style="margin-top:0">Para el tiempo que no es de ninguna OT. No genera horas ganadas:
     <b>descuenta jornada disponible</b>, así que no te baja la productividad.</p>
@@ -5065,12 +5064,21 @@ function mListas(){
       <select id="iniSem">${DIAS_SEM.map((d,i)=>`<option value="${i}" ${inicioSemana()===i?"selected":""}>${d.charAt(0).toUpperCase()+d.slice(1)}</option>`).join("")}</select></label>
     <label class="f" style="max-width:230px"><span>Días atrás que puede registrar el técnico</span>
       <input type="number" id="diasRetro" min="0" max="30" value="${DB.meta.diasRetro==null?2:DB.meta.diasRetro}"></label>
+    <label class="f" style="max-width:230px"><span>Excepción: permitir registrar desde</span>
+      <input type="date" id="fechaExcepcion" max="${hoyISO()}" value="${DB.meta.fechaMinimaExcepcion||""}"></label>
     <label class="f" style="max-width:280px"><span>¿Descontar el break?</span>
       <select id="brkOn"><option value="1" ${h.descontarBreak?"selected":""}>Sí — no cuenta como producción</option>
       <option value="0" ${!h.descontarBreak?"selected":""}>No — cuenta dentro de la jornada</option></select></label>
   </div>
   <p class="hint" style="margin-top:-4px">Semana: <b class="mono">${hrs(totalBruto)} h</b> pagadas · <b class="mono">${hrs(totalNeto)} h</b> disponibles para producción.
   La clave solo evita entradas por descuido al perfil de coordinación; no es seguridad real.</p>
+  ${DB.meta.fechaMinimaExcepcion?`<p class="hint" style="color:var(--signal);margin-top:-4px">
+    <b>Excepción activa:</b> los técnicos pueden registrar y corregir cualquier fecha desde
+    ${fmtFecha(DB.meta.fechaMinimaExcepcion)} en adelante, no solo los últimos ${DB.meta.diasRetro==null?2:DB.meta.diasRetro} día(s).
+    Bórrala de aquí cuando ya se hayan puesto al día — no se quita sola.</p>`
+   :`<p class="hint" style="margin-top:-4px">La excepción sirve para que los técnicos se pongan al día después de una falla —
+    como la de esta semana— sin tener que ampliarles el límite de días para siempre. Ponle una fecha,
+    déjalos registrar lo atrasado, y bórrala cuando terminen.</p>`}
   <button class="btn primary" id="guardarListas">Guardar cambios</button></div></div>`;
 }
 function pMaestros(){
@@ -5250,7 +5258,9 @@ function pMaestros(){
     const cierran=[...document.querySelectorAll("[data-cierra]")].filter(i=>i.checked).map(i=>i.dataset.cierra);
     const brk=Math.max(0,+$("#brk").value||0), brkOn=$("#brkOn").value==="1";
     const dr=Math.max(0,+$("#diasRetro").value||0), isem=+$("#iniSem").value||0;
-    commitMaestro(()=>{ Object.assign(DB,vals); DB.meta.horario={dias, breakMin:brk, descontarBreak:brkOn}; DB.meta.diasRetro=dr; DB.meta.inicioSemana=isem; DB.estadosCerrados=cierran; },"Guardado");
+    const fexc=$("#fechaExcepcion").value||"";
+    commitMaestro(()=>{ Object.assign(DB,vals); DB.meta.horario={dias, breakMin:brk, descontarBreak:brkOn}; DB.meta.diasRetro=dr;
+      DB.meta.inicioSemana=isem; DB.estadosCerrados=cierran; DB.meta.fechaMinimaExcepcion=fexc; },"Guardado");
   };
 }
 
@@ -7393,9 +7403,20 @@ function pConexion(){
 /* =========================================================================
    CORRECCIONES · nada se borra, todo queda con rastro de quién y cuándo
    ========================================================================= */
+/* La fecha más antigua que un técnico puede tocar hoy — para crear un
+   registro nuevo o para corregir/anular uno existente. Las dos cosas usan
+   la MISMA ventana a propósito: no tiene sentido dejar que alguien registre
+   algo de hace 2 días pero no pueda corregir un error en eso mismo.
+   Si coordinación activó una excepción (para ponerse al día después de una
+   falla), esa fecha manda si es más generosa que la ventana normal. */
+function fechaMinimaRegistro(){
+  const normal = restarDias(hoyISO(), DB.meta.diasRetro==null?2:DB.meta.diasRetro);
+  const exc = DB.meta.fechaMinimaExcepcion;
+  return (exc && exc < normal) ? exc : normal;
+}
 function puedeTocar(r){
   if(esCoordinador()) return true;
-  return r.tecnicoId===YO && r.fecha===hoyISO();   // el técnico corrige solo lo de hoy
+  return r.tecnicoId===YO && r.fecha>=fechaMinimaRegistro();   // misma ventana que para crear
 }
 async function anularRegistro(id){
   const r = byId(DB.registros,id); if(!r) return;

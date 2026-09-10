@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-09 · v63";
+const VERSION_APP = "2026-09-09 · v64";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -3294,13 +3294,15 @@ function vDashboard(){
 
   <div class="grid g2">
     <div class="card"><header><h2>Carga por técnico</h2><span class="sub mono">horas registradas contra su jornada</span></header>
-      <div class="body">${porTec.length?`<div class="bars">${porTec.map(x=>`
-        <div class="bar"><div class="t">${esc(x.t.nombre)}</div>
-          <div class="track"><i style="width:${Math.min(100,x.min/maxT*100)}%"></i></div>
-          <div class="n">${hrs(x.min)} / ${hrs(x.cap)} h
-            <span class="chip ${x.oc>=90?"c-verde":x.oc>=60?"c-ambar":"c-naranja"}" title="Horas registradas ÷ jornada">${x.oc}% ocupación</span>
-            <span class="chip ${x.pr>=85?"c-verde":x.pr>=60?"c-ambar":"c-naranja"}" title="De lo registrado, cuánto fue trabajo con orden detrás (el apoyo con OT cuenta; aseo y reuniones sin orden, no)">${x.pr}% productividad</span>
-            ${x.aus>0?` <span class="chip c-azul" title="Jornada descontada por ausencia">−${hrs(x.aus)} h</span>`:""}${x.ex>0?` <span class="chip c-naranja" title="Registró más horas que su jornada">+${hrs(x.ex)} h</span>`:""}</div></div>`).join("")}</div>`:`<div class="empty">Sin datos en el rango.</div>`}</div></div>
+      <div class="body">${porTec.length?`<div class="tw"><table><thead><tr>
+        <th>Técnico</th><th class="num">Horas</th><th class="num">Ocupación</th><th class="num">Productividad</th></tr></thead>
+        <tbody>${porTec.map(x=>`
+        <tr><td><b>${esc(x.t.nombre)}</b>
+            ${x.aus>0?`<br><span class="chip c-azul" title="Jornada descontada por ausencia">−${hrs(x.aus)} h ausencia</span>`:""}${x.ex>0?`<br><span class="chip c-naranja" title="Registró más horas que su jornada">+${hrs(x.ex)} h extra</span>`:""}</td>
+          <td class="num mono">${hrs(x.min)} / ${hrs(x.cap)} h</td>
+          <td class="num"><span class="chip ${x.oc>=90?"c-verde":x.oc>=60?"c-ambar":"c-naranja"}" title="Horas registradas ÷ jornada">${x.oc}%</span></td>
+          <td class="num"><span class="chip ${x.pr>=85?"c-verde":x.pr>=60?"c-ambar":"c-naranja"}" title="De lo registrado, cuánto fue trabajo con orden detrás (el apoyo con OT cuenta; aseo y reuniones sin orden, no)">${x.pr}%</span></td></tr>`).join("")}
+        </tbody></table></div>`:`<div class="empty">Sin datos en el rango.</div>`}</div></div>
 
     <div class="card"><header><h2>Horas por cuarto</h2></header>
       <div class="body">${porCuarto.length?`<div class="bars">${porCuarto.map(x=>`

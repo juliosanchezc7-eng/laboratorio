@@ -227,7 +227,7 @@ details.help .bd{padding:0 14px 14px;font-size:13.5px;color:var(--ink-2)}
      almacenamiento del navegador. Igual sirve, pero cada equipo por separado.
    - Siempre puedes exportar/importar el JSON completo (respaldo).
    ========================================================================= */
-const VERSION_APP = "2026-09-09 · v62";
+const VERSION_APP = "2026-09-09 · v63";
 const KEY = "labdiesel_db_v1";
 const KEY_ME = "labdiesel_tecnico_actual";
 const hasCloud = typeof window.storage !== "undefined" && window.storage;
@@ -2319,8 +2319,15 @@ function pasoOrden(){
   /* Un día de gracia: si coordinación marca la orden como cerrada hoy o ayer,
      sigue apareciendo para que quien la estaba trabajando alcance a registrar
      lo que hizo antes de que desaparezca. Pasado ese día, se va de la lista
-     como siempre. */
-  const abiertas = DB.ordenes.filter(o=>!cerr.has(o.estado) || (o.cerroEn && o.cerroEn>=ayer));
+     como siempre.
+     Si hay una excepción activa (para ponerse al día tras una falla), la
+     gracia se extiende hasta esa fecha — no solo un día — para que las
+     órdenes que se entregaron mientras la app no dejaba registrar sigan
+     visibles. Se revierte sola al borrar la excepción, igual que todo lo
+     demás que depende de ella. */
+  const graciaCierre = (DB.meta.fechaMinimaExcepcion && DB.meta.fechaMinimaExcepcion < ayer)
+    ? DB.meta.fechaMinimaExcepcion : ayer;
+  const abiertas = DB.ordenes.filter(o=>!cerr.has(o.estado) || (o.cerroEn && o.cerroEn>=graciaCierre));
   const filtradoPorCuarto = !R.todas && !!miCuarto;
   const base = filtradoPorCuarto ? abiertas.filter(o=>cuartosDeOrden(o).has(miCuarto)) : abiertas;
   const lista = base
@@ -2378,7 +2385,11 @@ function pasoOrden(){
                 return `${c.cantidad}× ${esc(nom(DB.tiposComponente,c.tipoComponenteId))}${tip}`;
               }).join(" · ")
             : (o.tipoTexto?`<span class="tag">TIPO: ${esc(o.tipoTexto)}</span>`:`<span class="tag">sin componentes cargados</span>`)}</div>
-          ${(cerr.has(o.estado) && o.cerroEn)?`<div class="meta" style="color:var(--signal)">Ya se cerró en la hoja — puedes registrar lo de hoy, mañana ya no aparecerá</div>`:""}</div>
+          ${(cerr.has(o.estado) && o.cerroEn)?`<div class="meta" style="color:var(--signal)">Ya se cerró en la hoja — ${
+            (DB.meta.fechaMinimaExcepcion && DB.meta.fechaMinimaExcepcion<ayer)
+              ? `puedes registrar hasta que coordinación cierre la excepción de fechas`
+              : `puedes registrar lo de hoy, mañana ya no aparecerá`
+          }</div>`:""}</div>
           <div class="r">${chipEstado(o.estado)}</div>
         </button>`;}).join("")}</div>`
       :`<div class="empty">${q
